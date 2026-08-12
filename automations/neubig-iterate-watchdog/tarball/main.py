@@ -424,46 +424,70 @@ def build_prompt(pr: dict, reasons: list[str]) -> str:
 {base}"""
 
 
-def dispatch_conversation(pr: dict, reasons: list[str], secrets: dict) -> str:
-    """Start one async fix conversation for a PR; returns its conversation id."""
-    from openhands.sdk import Conversation  # noqa: PLC0415
-    from openhands.tools.preset.default import get_default_agent  # noqa: PLC0415
+def _workspace_ctx():
+    """Return the SDK workspace context manager for the current runtime.
+
+    Local mode (``AGENT_SERVER_URL`` set) uses ``RemoteWorkspace`` talking
+    straight to the local agent server (as the ``graham-daily-workflow-prep``
+    automation does); otherwise ``OpenHandsCloudWorkspace`` for a cloud sandbox.
+    Exiting this context fires the automation completion callback exactly once,
+    which is why the whole real-run body is wrapped in a single ``with``.
+    """
+    from openhands.sdk.workspace.remote.base import RemoteWorkspace  # noqa: PLC0415
     from openhands.workspace import OpenHandsCloudWorkspace  # noqa: PLC0415
 
     api_url = os.environ.get("AGENT_SERVER_URL", "").rstrip("/")
-    api_key = _session_key()
-    model_profile = os.environ.get("AUTOMATION_MODEL") or None
-
-    with OpenHandsCloudWorkspace(
+    session_key = _session_key()
+    if api_url:
+        workspace_base = os.path.expanduser(
+            os.environ.get("WORKSPACE_BASE", "/workspace")
+        )
+        Path(workspace_base).mkdir(parents=True, exist_ok=True)
+        log(f"local mode: RemoteWorkspace at {api_url} (dir {workspace_base})")
+        return RemoteWorkspace(
+            host=api_url,
+            api_key=session_key or None,
+            working_dir=workspace_base,
+        )
+    log("cloud mode: OpenHandsCloudWorkspace")
+    return OpenHandsCloudWorkspace(
         local_agent_server_mode=True,
         cloud_api_url=api_url,
-        cloud_api_key=api_key,
-    ) as workspace:
-        try:
-            llm = workspace.get_llm(profile_name=model_profile)
-        except FileNotFoundError:
-            if not model_profile:
-                raise
-            log(f"profile {model_profile!r} not found; using default")
-            llm = workspace.get_llm()
-        agent = get_default_agent(llm=llm, cli_mode=True)
-        conversation = Conversation(
-            agent=agent,
-            workspace=workspace,
-            delete_on_close=False,  # keep history visible in the UI
-        )
-        if secrets:
-            conversation.update_secrets(secrets)
-        prompt = build_prompt(pr, reasons)
-        conversation.update_secrets(
-            {"AUTOMATION_SESSION_URL": f"{api_url}/conversations/{conversation.id}"}
-        )
-        log(
-            f"dispatching fix conversation for {pr['full_name']}#{pr['number']} "
-            f"(id={conversation.id})"
-        )
-        conversation.send_message(prompt)
-        return conversation.id
+        cloud_api_key=session_key or "",
+        keep_alive=True,
+    )
+
+
+def dispatch_in_workspace(
+    workspace, agent, pr: dict, reasons: list[str], token: str
+) -> str:
+    """Start one async fix conversation for a PR and return its conversation id.
+
+    ``send_message`` alone only enqueues with ``run: False``, so ``run`` with
+    ``blocking=False`` is required to trigger execution on the agent server and
+    return immediately — the conversation keeps running after this run exits.
+    """
+    from openhands.sdk import Conversation  # noqa: PLC0415
+
+    conversation = Conversation(
+        agent=agent,
+        workspace=workspace,
+        delete_on_close=False,  # keep history visible in the UI
+    )
+    conversation.update_secrets({"GITHUB_TOKEN": token})
+    prompt = build_prompt(pr, reasons)
+    log(
+        f"dispatching fix conversation for {pr['full_name']}#{pr['number']} "
+        f"(id={conversation.id})"
+    )
+    conversation.send_message(prompt)
+    conversation.run(blocking=False, timeout=30)
+    conv_id = str(conversation.id)  # conversation.id is a UUID; store as str for JSON state
+    log(
+        f"started conversation {conv_id} (fire-and-forget; still running "
+        f"on the agent server after this run exits)"
+    )
+    return conv_id
 
 
 # --------------------------------------------------------------------------- #
@@ -587,34 +611,54 @@ def main() -> None:
 
     # 3. Dispatch fix conversations.
     dry_run = os.environ.get("ITERATE_DRY_RUN", "") == "1"
-    if not to_dispatch:
-        log("no PRs require attention this run")
-    else:
-        if dry_run:
-            log(f"DRY RUN: would dispatch {len(to_dispatch)} conversation(s)")
-            for pr, reasons in to_dispatch:
-                log(f'  - {pr["full_name"]}#{pr["number"]}: {"; ".join(reasons)}')
+    if dry_run:
+        log(f"DRY RUN: would dispatch {len(to_dispatch)} conversation(s)")
+        for pr, reasons in to_dispatch:
+            log(f'  - {pr["full_name"]}#{pr["number"]}: {"; ".join(reasons)}')
+        save_state(state)
+        log("DRY RUN complete (check-only; no completion callback)")
+        return
+
+    # Real run: wrap the whole body in ONE workspace context so the completion
+    # callback fires exactly once on exit — covering both the dispatch path and
+    # the "nothing to do" path (otherwise a no-op run would never fire it).
+    with _workspace_ctx() as workspace:
+        model_profile = os.environ.get("AUTOMATION_MODEL") or None
+        try:
+            llm = workspace.get_llm(profile_name=model_profile)
+        except FileNotFoundError:
+            if not model_profile:
+                raise
+            log(f"profile {model_profile!r} not found; using default")
+            llm = workspace.get_llm()
+        from openhands.tools.preset.default import get_default_agent  # noqa: PLC0415
+
+        agent = get_default_agent(llm=llm, cli_mode=True)
+        dispatch_count = 0
+        if not to_dispatch:
+            log("no PRs require attention this run")
         else:
-            # Pass GITHUB_TOKEN to the spawned agents so `gh` works for them.
-            secrets = {"GITHUB_TOKEN": token}
             for pr, reasons in to_dispatch:
                 key = f"{pr['full_name']}#{pr['number']}"
                 rec = prs[key]
                 try:
-                    conv_id = dispatch_conversation(pr, reasons, secrets)
+                    conv_id = dispatch_in_workspace(
+                        workspace, agent, pr, reasons, token
+                    )
                     rec.setdefault("conv_ids", []).append(conv_id)
                     rec["attempts"] = rec.get("attempts", 0) + 1
                     rec["last_dispatched_at"] = now
                     rec["needs_human"] = None
+                    dispatch_count += 1
                 except Exception as exc:  # noqa: BLE001
                     log(f"failed to dispatch {key}: {exc}")
                     # Do not count it as an attempt; it never started.
-
-    save_state(state)
-    if dry_run:
-        log(f"DRY RUN complete; state saved for {len(prs)} tracked PR(s)")
-    else:
-        log(f"started {len(to_dispatch)} fix conversation(s); run complete")
+            log(f"started {dispatch_count} fix conversation(s)")
+        # Persist state BEFORE the workspace exits so that the completion
+        # callback (fired on __exit__) reflects durable, up-to-date state.
+        save_state(state)
+        log("run complete")
+    # WORKSPACE EXIT above fired the completion callback.
 
 
 if __name__ == "__main__":
