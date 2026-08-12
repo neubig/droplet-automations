@@ -1,0 +1,50 @@
+enabled: true
+entrypoint: .venv/bin/python main.py
+keep_alive: null
+model: null
+name: Neubig Iterate Watchdog
+preset_metadata: null
+prompt: |-
+  Hourly watchdog that drives neubig's open PRs to merge-ready per the /iterate skill.
+
+  Each run (pure GitHub API parsing, no LLM):
+    1. Finds open, non-draft PRs authored by `neubig` (search: author:neubig type:pr is:open).
+    2. For each, checks whether the /iterate "merge-ready" conditions are NOT satisfied:
+       - failing CI checks on the head commit,
+       - a review still in `CHANGES_REQUESTED` state,
+       - unresolved review threads awaiting a response.
+
+  If any PRs need attention, it dispatches up to 4 OpenHands agent conversations (one
+  per PR), each told to run the /iterate loop on that PR: poll every *present*
+  verification layer (CI checks, pr-review bot if present, QA bot if present), fix
+  branch-related failures, address/resolve review threads, push to the PR head branch,
+  re-request review, and re-poll until all present layers are green or a genuine blocker
+  is hit. Dispatch is fire-and-forget; the run completes immediately so the hourly
+  cadence holds while fix conversations continue on the agent server.
+
+  Boundary handling (prevents re-triggering the same PR forever):
+  - In-flight guard: a PR with an active fix conversation is never re-dispatched.
+  - Attempt budget: a PR is dispatched at most 3 times per head SHA; once exhausted it
+    is flagged `needs_human` and skipped until the head SHA changes (a new push).
+  - Head-SHA reset: a new head SHA clears the attempt budget and needs_human marker.
+  - The dispatched agent stops (rather than looping) and leaves a `[iterate-watchdog]
+    block: ...` comment when a failure is unfixable (permissions, infra outage, flaky
+    budget exhausted, ambiguity).
+  - Draft PRs are skipped; merged/closed PRs fall out of the `is:open` query.
+
+  State (in-flight conversations, attempt budgets, needs_human markers) is kept in the
+  per-automation KV store with a local-file fallback.
+
+  Tunables (env): ITERATE_MAX_PER_RUN (default 4), ITERATE_MAX_ATTEMPTS_PER_SHA
+  (default 3), ITERATE_GITHUB_AUTHOR (default neubig), ITERATE_DRY_RUN=1 to check only.
+setup_script_path: setup.sh
+tarball_executables:
+- setup.sh
+tarball_source:
+  type: internal
+  url: null
+timeout: 600
+trigger:
+  schedule: 0 * * * *
+  timezone: UTC
+  type: cron
