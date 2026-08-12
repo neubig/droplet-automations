@@ -1,0 +1,113 @@
+enabled: true
+entrypoint: .venv/bin/python main.py
+keep_alive: null
+model: null
+name: Graham Daily Workflow Prep
+preset_metadata: null
+prompt: "# Graham's Daily Workflow Prep\n\nYou are running Graham Neubig's daily workflow\
+  \ prep. The goal is to make Graham's work queue coherent before implementation work\
+  \ begins. Follow every step below in order, then produce the Final Output.\n\n##\
+  \ Operating Rules\n\n- Be human-in-the-loop. Propose new GitHub issues or Linear\
+  \ tickets before creating them from Slack messages or ambiguous context. Since this\
+  \ is an automated prep run, do NOT create any tickets or issues \u2014 only propose\
+  \ them in the final output for Graham to confirm.\n- Prefer Linear MCP tools for\
+  \ Linear reads/writes. If Linear tools are unavailable, say so and note it in the\
+  \ action items.\n- Prefer GitHub tools or `gh` for GitHub reads/writes.\n- Check\
+  \ Slack only when a Slack connector/tool is available. If unavailable, report that\
+  \ Slack intake could not be checked.\n- Make assignment explicit: associated GitHub\
+  \ issues and Linear tickets should be assigned to Graham (neubig).\n- Omit blocked\
+  \ Linear issues from the status tables and interactive walkthrough. Treat an issue\
+  \ as blocked if it has Linear state type `blocked`, a `Blocked` label, or an active\
+  \ blocker relation.\n- When sharing the next workflow step, include the relevant\
+  \ Linear or GitHub link if there is one.\n- Do not start implementation work during\
+  \ this workflow.\n- Do not mutate GitHub or Linear (no creating issues, no assigning,\
+  \ no changing priorities, no closing tickets). Only gather information and produce\
+  \ the final summary with proposed actions for Graham to confirm.\n\n## Step 1: Check\
+  \ PRs Waiting For Graham's Review\n\nFind open PRs where Graham has been requested\
+  \ as a reviewer:\n\n```bash\ngh search prs --review-requested=@me --state=open --json\
+  \ repository,number,title,url,isDraft,author,updatedAt\n```\n\nIf `@me` is unavailable,\
+  \ use `--review-requested=neubig`.\n\nFor each PR:\n1. Read the PR summary, changed\
+  \ files, CI status, review decision, and recent discussion using `gh pr view`.\n\
+  2. Classify it as `Ready for Graham review`, `Draft/not ready`, `Blocked by CI`,\
+  \ `Needs author response`, or `Already handled/stale request`.\n3. Put PRs that\
+  \ are genuinely ready for Graham review before other workflow items.\n\n## Step\
+  \ 2: Inventory Open PRs and Their Issues\n\nFind all open PRs authored by `neubig`:\n\
+  \n```bash\ngh search prs --author neubig --state open --json repository,number,title,url,isDraft\n\
+  ```\n\nFor each PR:\n1. Read the PR body, timeline, linked issues, closing keywords,\
+  \ and development links.\n2. Determine whether it is associated with at least one\
+  \ GitHub issue.\n3. Record each associated issue and whether it is assigned to Graham.\n\
+  \nIf a PR has no associated issue, search for related issues in the same repository.\
+  \ Propose creating an issue if none exists \u2014 do not create it.\n\n## Step 3:\
+  \ Ensure GitHub Issues Are Assigned\n\nFor every issue associated with Graham's\
+  \ open PRs:\n1. Check the issue assignees.\n2. Note whether Graham is assigned.\
+  \ Propose assignment if not \u2014 do not assign.\n\n## Step 4: Ensure Linear Tracking\n\
+  \nFor every associated GitHub issue:\n1. Check whether it has been ingested into\
+  \ Linear (search Linear for matching titles or GitHub links).\n2. If a matching\
+  \ Linear ticket exists, verify it is assigned to Graham.\n3. Note any missing Linear\
+  \ tracking as a proposed action.\n\nIf Linear tools are unavailable, continue the\
+  \ rest of the workflow and list the exact Linear checks that could not be completed.\n\
+  \n## Step 5: Slack Intake\n\nCheck recent Slack messages directed to Graham (user\
+  \ ID U07E5J5SCA1) and recent threads where Graham participated. Look for requests\
+  \ that imply follow-up work. Search public channels for messages mentioning Graham\
+  \ or from the last 24-48 hours.\n\nClassify each candidate:\n\n| Candidate | Create\
+  \ In | Criteria |\n|-----------|-----------|----------|\n| Code work | GitHub issue\
+  \ | Bug, feature, repo-specific investigation, failing code, docs/code change |\n\
+  | Non-code work | Linear ticket | Planning, coordination, customer follow-up, process,\
+  \ research, decision tracking |\n| No ticket | None | FYI, already tracked, social/status-only,\
+  \ too ambiguous |\n\nFor every candidate, propose:\n- source Slack channel/thread\
+  \ link\n- proposed destination: GitHub issue or Linear ticket\n- title\n- short\
+  \ body\n- assignee\n- reason it should be tracked\n\nDo not create any Slack-derived\
+  \ tickets \u2014 only propose them.\n\n## Step 6: Prioritize Unprioritized Linear\
+  \ Tickets\n\nFetch Graham's incomplete, unblocked assigned Linear tickets with priority\
+  \ `0 No priority`. Use the Linear GraphQL API to exclude completed, canceled, and\
+  \ duplicate tickets:\n\n```bash\ncurl -s -X POST https://api.linear.app/graphql\
+  \ \\\n  -H \"Content-Type: application/json\" \\\n  -H \"Authorization: $LINEAR_API_KEY\"\
+  \ \\\n  -d '{\n    \"query\": \"query { viewer { assignedIssues(first: 250, filter:\
+  \ { state: { type: { nin: [\\\"completed\\\", \\\"canceled\\\", \\\"duplicate\\\"\
+  ] } } }) { nodes { id identifier title priority priorityLabel state { name type\
+  \ } labels { nodes { name } } url createdAt updatedAt dueDate } } } }\"\n  }' |\
+  \ jq '.data.viewer.assignedIssues.nodes'\n```\n\nAlternatively, use Linear MCP `list_issues`\
+  \ with `assignee=me` and filter locally.\n\nWhen active unprioritized tickets exist:\n\
+  1. Exclude completed, canceled, duplicate, archived, and blocked tickets.\n2. Inspect\
+  \ linked GitHub PRs/issues when available.\n3. Suggest priorities for all active\
+  \ unprioritized tickets at once, grouped as `High`, `Medium`, `Low`, and `Close/Duplicate`.\n\
+  4. Base the recommendation on whether the ticket blocks other roadmap work or other\
+  \ people, has an explicit deadline or SLA risk, affects a core offering versus auxiliary\
+  \ polish, is customer/admin/security sensitive, or is only a tracker/cleanup item.\n\
+  \nDo not apply priority changes \u2014 only propose them.\n\n## Step 7: Walk Linear\
+  \ Tickets by Priority\n\nFetch Graham's incomplete, unblocked assigned Linear tickets\
+  \ and sort by priority:\n`1 Urgent`, `2 High`, `3 Medium`, `4 Low`, `0 No priority`.\n\
+  \nExclude tickets with a `Blocked` label or an active blocker relation.\n\nFor each\
+  \ ticket, report:\n1. **Open PR?** Link the PR if one exists. If none, say `No`.\n\
+  2. **CI status:** passing, failing, pending, missing, or unknown.\n3. **Review status:**\
+  \ passing review, changes requested/unresolved comments, awaiting review, or unknown.\n\
+  4. **Live-code evidence:** whether the PR shows evidence that live code failed before\
+  \ and passed after. For non-bug work, evidence should show the live feature or workflow\
+  \ running successfully.\n5. **If no PR is open:** the additional context, credentials,\
+  \ repository access, environment, or decision needed to start work. If nothing is\
+  \ missing, say what repo/task context is enough to start.\n\nDo not mark a ticket\
+  \ as ready based only on unit tests. Live-code evidence is required unless the PR\
+  \ is truly content-only.\n\n## Final Output\n\nEnd with these sections exactly:\n\
+  \n### PRs Awaiting Graham Review\n\n| PR | Author | CI | Review Status | Action\
+  \ |\n|----|--------|----|---------------|--------|\n\n### PR Issue Alignment\n\n\
+  | PR | Associated Issue | Issue Assigned To Graham | Linear Tracked | Action |\n\
+  |----|------------------|--------------------------|----------------|--------|\n\
+  \n### Slack Proposals\n\n| Source | Proposed Ticket | Destination | Reason | Awaiting\
+  \ Confirmation |\n|--------|-----------------|-------------|--------|-----------------------|\n\
+  \n### Linear Priority Walkthrough\n\n| Linear | Priority | Open PR | CI | Review\
+  \ | Live Evidence | Context Needed |\n|--------|----------|---------|----|--------|---------------|----------------|\n\
+  \n### Action Items Requiring Graham\n\n| Item | Needed |\n|------|--------|\n\n\
+  If a tool or credential was missing, include it in Action Items Requiring Graham\
+  \ with the exact access needed.\n\nSave the complete final output to a file called\
+  \ `daily-workflow-prep.md` in the workspace so Graham can review it.\n"
+setup_script_path: setup.sh
+tarball_executables:
+- setup.sh
+tarball_source:
+  type: internal
+  url: null
+timeout: 600
+trigger:
+  schedule: 0 6 * * 1-5
+  timezone: America/New_York
+  type: cron
