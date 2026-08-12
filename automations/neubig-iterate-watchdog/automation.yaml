@@ -1,4 +1,4 @@
-enabled: false
+enabled: true
 entrypoint: .venv/bin/python main.py
 keep_alive: null
 model: null
@@ -9,7 +9,7 @@ setup_script_path: setup.sh
 tarball_source:
   type: internal
   url: null
-timeout: 600
+timeout: 1200
 trigger:
   schedule: 0 * * * *
   timezone: UTC

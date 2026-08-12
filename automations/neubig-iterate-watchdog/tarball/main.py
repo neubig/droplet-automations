@@ -11,16 +11,28 @@ On every run:
      - unresolved review threads awaiting a response.
    Parsing the queries below costs no LLM tokens.
 
-2. **Dispatch (LLM).** For up to ``MAX_PER_RUN`` PRs that need attention, start one
-   OpenHands conversation per PR whose prompt tells it to run the /iterate loop on
-   that PR and push fixes until every present verification layer is green. Dispatch
-   is fire-and-forget: the conversation keeps running on the agent server after this
-   run exits, and the run completes immediately so the hourly cadence holds.
+2. **Engage (LLM, deduplicated).** For PRs that need attention, the watchdog
+   first snapshots the agent server's conversations (their tags and execution
+   state) and then, per PR, either *starts* an OpenHands conversation whose prompt
+   tells it to run the /iterate loop on that PR, or *follows up* on an existing
+   one. Every conversation it starts is tagged ``iterate`` and
+   ``iterate:{org}/{repo}#{number}``. Engagement is fire-and-forget: the
+   conversation keeps running on the agent server after this run exits, and the
+   run completes immediately so the hourly cadence holds.
 
 **Boundary handling — prevent re-triggering the same PR over and over:**
 
-- *In-flight guard.* A PR that already has an active fix conversation is never
-  re-dispatched, so two agents never fight over the same branch.
+- *Open-conversation cap.* The watchdog never keeps more than
+  ``MAX_OPEN_CONVERSATIONS`` (default 8) of its own conversations open at once.
+  Both brand-new starts and follow-ups count toward this ceiling.
+- *Per-PR dedup by tag.* If a conversation tagged ``iterate:{org}/{repo}#{number}``
+  already exists for a PR:
+    - it is **running** (``ACTIVE_STATUSES``) → the watchdog skips it, so two agents
+      never fight over the same branch;
+    - it is **not running** → the watchdog sends the existing conversation a follow-up
+      message instead of creating a new one.
+  A fallback to the state-recorded ``conv_ids`` is kept for conversations created
+  before tagging was introduced.
 - *Attempt budget.* A PR is dispatched at most ``MAX_ATTEMPTS_PER_SHA`` times per head
   SHA. Once exhausted the PR is marked ``needs_human`` and skipped until the head SHA
   changes. This is the defence against genuinely unfixable CI: rather than spinning
@@ -65,6 +77,22 @@ MAX_PER_RUN = int(os.environ.get("ITERATE_MAX_PER_RUN", "4"))
 # Max fix dispatch attempts before a given head SHA is considered un-actionable.
 MAX_ATTEMPTS_PER_SHA = int(os.environ.get("ITERATE_MAX_ATTEMPTS_PER_SHA", "3"))
 
+# Upper bound on the number of simultaneously-open /iterate conversations. The
+# watchdog never lets more than this many of its conversations be in a non-
+# terminal (still-usable) state at once: new conversations are only started (and
+# finished ones only re-engaged via a follow-up) while the running tally is below
+# this ceiling.
+MAX_OPEN_CONVERSATIONS = int(
+    os.environ.get("ITERATE_MAX_OPEN_CONVERSATIONS", "8")
+)
+
+# Hard deadline (seconds) for the whole agent-server conversation listing. The
+# agent server builds full info per conversation and can be slow when it has
+# accumulated many; bounding the listing keeps an unresponsive search from
+# stalling (and eventually timing out) the whole run. On deadline the listing
+# raises and the watchdog falls back to its state-recorded conversation ids.
+LISTING_DEADLINE = int(os.environ.get("ITERATE_LISTING_DEADLINE", "90"))
+
 # GitHub check-run conclusions that mean "this PR is not merge-ready".
 FAILURE_CONCLUSIONS = {
     "failure",
@@ -78,13 +106,48 @@ FAILURE_CONCLUSIONS = {
 REVIEWER_AUTHOR_ASSOCIATIONS = {"COLLABORATOR", "MEMBER", "OWNER"}
 REVIEWER_BOT_LOGINS = {"all-hands-bot", "openhands", "openhands[bot]"}
 
-# Agent-server conversation execution states we treat as "still working".
+# Agent-server conversation execution states.
+
+# Statuses where the agent is actively executing right now. A conversation in one
+# of these states counts as "running" for the per-PR in-flight guard (a duplicate
+# is never started while one is running).
 ACTIVE_STATUSES = {
     "running",
     "queued",
     "waiting_for_confirmation",
     "paused",
 }
+
+# Statuses that mean the conversation's lifecycle is still open (non-terminal):
+# it either is doing work now or can receive a follow-up. Only conversations with
+# a non-terminal status count against MAX_OPEN_CONVERSATIONS.
+OPEN_STATUSES = {
+    *ACTIVE_STATUSES,
+    "idle",  # created, ready to receive tasks
+}
+
+# Conversation tags. Every conversation this watchdog starts (or follows up on)
+# gets two tags:
+#   "iterate"      -> marks the conversation as part of the /iterate automation
+#   "iterepo"      -> per-PR identity, value = `iterate:{org}/{repo}#{number}`
+# The platform restricts tag KEYS to `[a-z0-9]+`, so the org/repo#number identity
+# that the user wants in the second tag travels in the tag VALUE under a fixed,
+# valid key rather than in the key itself.
+TAG_FLAG = "iterate"
+TAG_TARGET = "iterepo"
+
+
+def conversation_identity_tag(pr: dict) -> str:
+    """`iterate:{org}/{repo}#{number}` — the per-PR conversation tag value."""
+    return f"iterate:{pr['full_name']}#{pr['number']}"
+
+
+def conversation_tags(pr: dict) -> dict[str, str]:
+    """The two tags assigned to a freshly-started iterate conversation."""
+    return {
+        TAG_FLAG: GITHUB_AUTHOR,
+        TAG_TARGET: conversation_identity_tag(pr),
+    }
 
 _GH_API = "https://api.github.com"
 _STATE_FILE_KEY = "iterate-watchdog-state"
@@ -391,11 +454,70 @@ def conversation_active(conv_id: str) -> bool:
     return str(status).lower() in ACTIVE_STATUSES
 
 
-def _any_conv_active(conv_ids: list[str]) -> bool:
-    for cid in conv_ids or []:
-        if conversation_active(cid):
-            return True
-    return False
+def _agent_server() -> tuple[str, str]:
+    """Return (agent_server_url, session_api_key); empty tuple if unavailable."""
+    url = os.environ.get("AGENT_SERVER_URL", "").rstrip("/")
+    key = _session_key()
+    if not url or not key:
+        return "", ""
+    return url, key
+
+
+def list_agent_conversations() -> list[dict]:
+    """Page through every conversation on the agent server.
+
+    Returns a list of ``{"id", "status", "tags"}`` records so the watchdog can
+    (a) count how many of its /iterate conversations are currently open and
+    (b) find an already-existing conversation tagged with a PR's identity, both
+    to avoid duplicate dispatches and to send follow-ups instead.
+
+    If the agent server (or session key) is unavailable this raises, and the
+    caller falls back to per-Id state checks.
+    """
+    url, key = _agent_server()
+    if not url or not key:
+        raise RuntimeError("AGENT_SERVER_URL / SESSION_API_KEY not available")
+
+    records: list[dict] = []
+    deadline = time.time() + LISTING_DEADLINE
+    page_id: str | None = None
+    while True:
+        if time.time() > deadline:
+            raise TimeoutError(
+                f"conversation listing exceeded {LISTING_DEADLINE}s deadline "
+                f"(failed mid-pagination at {len(records)} records)"
+            )
+        query = "limit=100"
+        if page_id:
+            query += f"&page_id={urllib.parse.quote(page_id)}"
+        req = urllib.request.Request(
+            f"{url}/api/conversations/search?{query}",
+            headers={
+                "X-Session-API-Key": key,
+                "ngrok-skip-browser-warning": "1",
+                # Don't reuse a keep-alive socket: an upstream that is slow to
+                # build a page would otherwise swallow the socket timeout below
+                # and let the whole run hang until its own process timeout.
+                "Connection": "close",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        for it in data.get("items", []):
+            status = it.get("execution_status")
+            if isinstance(status, dict):
+                status = status.get("value") or status.get("name")
+            records.append(
+                {
+                    "id": str(it.get("id")),
+                    "status": str(status).lower() if status else "",
+                    "tags": it.get("tags") or {},
+                }
+            )
+        page_id = data.get("next_page_id")
+        if not page_id:
+            break
+    return records
 
 
 # --------------------------------------------------------------------------- #
@@ -458,34 +580,50 @@ def _workspace_ctx():
     )
 
 
-def dispatch_in_workspace(
-    workspace, agent, pr: dict, reasons: list[str], token: str
+def engage_in_workspace(
+    workspace,
+    agent,
+    pr: dict,
+    reasons: list[str],
+    token: str,
+    *,
+    target_id: str | None = None,
 ) -> str:
-    """Start one async fix conversation for a PR and return its conversation id.
+    """Start (or follow up on) an async fix conversation for a PR.
 
-    ``send_message`` alone only enqueues with ``run: False``, so ``run`` with
-    ``blocking=False`` is required to trigger execution on the agent server and
-    return immediately — the conversation keeps running after this run exits.
+    * ``target_id is None``: create a brand-new conversation, tagged with
+      ``iterate`` and ``iterate:{org}/{repo}#{number}``, and kick it off.
+    * ``target_id`` set: re-attach to that existing conversation and send it a
+      follow-up message instead of creating a duplicate.
+
+    Returns the conversation id. ``send_message`` alone only enqueues with
+    ``run: False``, so ``run`` with ``blocking=False`` is required to trigger
+    execution on the agent server and return immediately — the conversation keeps
+    running after this run exits.
     """
     from openhands.sdk import Conversation  # noqa: PLC0415
 
+    tags = conversation_tags(pr)
     conversation = Conversation(
         agent=agent,
         workspace=workspace,
         delete_on_close=False,  # keep history visible in the UI
+        conversation_id=target_id,  # None => create a new conversation
+        tags=tags,  # only applied at creation; harmless on an attach
     )
     conversation.update_secrets({"GITHUB_TOKEN": token})
     prompt = build_prompt(pr, reasons)
+    action = "following up on" if target_id else "dispatching fix for"
     log(
-        f"dispatching fix conversation for {pr['full_name']}#{pr['number']} "
-        f"(id={conversation.id})"
+        f"{action} conversation for {pr['full_name']}#{pr['number']} "
+        f"(id={conversation.id}, tags={tags})"
     )
     conversation.send_message(prompt)
     conversation.run(blocking=False, timeout=30)
     conv_id = str(conversation.id)  # conversation.id is a UUID; store as str for JSON state
     log(
-        f"started conversation {conv_id} (fire-and-forget; still running "
-        f"on the agent server after this run exits)"
+        f"{'engaged' if target_id else 'started'} conversation {conv_id} "
+        f"(fire-and-forget; still running on the agent server after this run exits)"
     )
     return conv_id
 
@@ -562,9 +700,39 @@ def main() -> None:
         log(f"WARN {key}: needs attention ({reasons_text})")
         candidates.append((pr, reasons))
 
-    # 2. Decide which candidates to dispatch, honoring boundary guards.
+    # 2. Decide which candidates to engage (start new or send a follow-up),
+    #    honoring the boundary guards (per-head attempt budget, in-flight guard,
+    #    per-run cap) and the global cap on open /iterate conversations.
+
+    # Snapshot the agent server's conversation set once. It's used both to find
+    # an already-existing "iterate:{org}/{repo}#{number}" tagged conversation per
+    # PR (so we can avoid duplicates and send follow-ups instead) and to count
+    # how many /iterate conversations are currently open.
+    conv_listing: list[dict] | None = None
+    conv_index: dict[str, dict] = {}  # id -> {"id","status","tags"}
+    iterate_open = 0  # number of open (non-terminal) /iterate conversations
+    identity_ids: dict[str, list[str]] = {}  # iterate identity tag -> [conv ids]
+    try:
+        conv_listing = list_agent_conversations()
+        for c in conv_listing:
+            conv_index[c["id"]] = c
+            tagged = TAG_FLAG in (c["tags"] or {})
+            if c["status"] in OPEN_STATUSES and tagged:
+                iterate_open += 1
+            identity = (c["tags"] or {}).get(TAG_TARGET)
+            if identity and tagged:
+                identity_ids.setdefault(identity, []).append(c["id"])
+        log(
+            f"agent server: {len(conv_listing)} conversation(s) total, "
+            f"{iterate_open} open /iterate conversation(s)"
+        )
+    except Exception as exc:  # noqa: BLE001 - tag dedup unavailable
+        log(f"could not list agent conversations ({exc}); falling back to state")
+
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
-    to_dispatch: list[tuple[dict, list[str]]] = []
+    plan: list[dict] = []  # {action, pr, reasons, target_id}
+    open_used = iterate_open  # running tally; both starts and follow-ups consume a slot
+    new_started = 0  # how many brand-new conversations we've queued this run
 
     for pr, reasons in candidates:
         key = f"{pr['full_name']}#{pr['number']}"
@@ -585,10 +753,6 @@ def main() -> None:
             log(f"skip {key}: flagged needs_human ({reason}); waiting for new push")
             continue
 
-        if _any_conv_active(rec.get("conv_ids", [])):
-            log(f"skip {key}: fix conversation already in flight")
-            continue
-
         if rec.get("attempts", 0) >= MAX_ATTEMPTS_PER_SHA:
             rec["needs_human"] = {
                 "reason": (
@@ -603,18 +767,83 @@ def main() -> None:
             )
             continue
 
-        if len(to_dispatch) >= MAX_PER_RUN:
-            log(f"skip {key}: already dispatching {MAX_PER_RUN} this run")
+        # Collect every conversation we already know of for this PR:
+        #  - any conversation tagged with this PR's iterate identity
+        #  - any legacy conv id recorded in state (pre-tag automations)
+        identity = conversation_identity_tag(pr)
+        known_ids: list[str] = list(identity_ids.get(identity, []))
+        if conv_listing is not None:
+            known_ids += [
+                cid for cid in rec.get("conv_ids", [])
+                if cid not in known_ids and cid in conv_index
+            ]
+        else:
+            known_ids += [
+                cid for cid in rec.get("conv_ids", []) if cid not in known_ids
+            ]
+
+        if conv_listing is not None:
+            active = [
+                cid for cid in known_ids
+                if conv_index.get(cid, {}).get("status") in ACTIVE_STATUSES
+            ]
+        else:
+            active = [cid for cid in known_ids if conversation_active(cid)]
+
+        if active:
+            # (2a) A tagged conversation for this PR is already running: don't
+            # start a duplicate — it's already being worked.
+            log(f"skip {key}: fix conversation already in flight ({active[0]})")
             continue
 
-        to_dispatch.append((pr, reasons))
+        if known_ids:
+            # (2b) A tagged conversation exists but is not running: send it a
+            # follow-up message instead of creating a new conversation.
+            target_id = known_ids[-1]
+            plan.append(
+                {
+                    "action": "follow_up",
+                    "pr": pr,
+                    "reasons": reasons,
+                    "target_id": target_id,
+                }
+            )
+            open_used += 1
+            log(
+                f"FOLLOW-UP {key}: re-engaging conversation {target_id} "
+                f"({'; '.join(reasons)})"
+            )
+            continue
 
-    # 3. Dispatch fix conversations.
+        # No existing conversation for this PR: start a new one, subject to the
+        # per-run cap and the global cap on open /iterate conversations.
+        if new_started >= MAX_PER_RUN:
+            log(f"skip {key}: already starting {MAX_PER_RUN} this run")
+            continue
+        if open_used >= MAX_OPEN_CONVERSATIONS:
+            log(
+                f"skip {key}: already at {MAX_OPEN_CONVERSATIONS} open /iterate "
+                f"conversations (MAX_OPEN_CONVERSATIONS)"
+            )
+            continue
+        plan.append(
+            {"action": "new", "pr": pr, "reasons": reasons, "target_id": None}
+        )
+        new_started += 1
+        open_used += 1
+        log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
+
+    # 3. Engage (start / follow up on) fix conversations.
     dry_run = os.environ.get("ITERATE_DRY_RUN", "") == "1"
     if dry_run:
-        log(f"DRY RUN: would dispatch {len(to_dispatch)} conversation(s)")
-        for pr, reasons in to_dispatch:
-            log(f'  - {pr["full_name"]}#{pr["number"]}: {"; ".join(reasons)}')
+        log(f"DRY RUN: would engage {len(plan)} conversation(s)")
+        for item in plan:
+            pr = item["pr"]
+            kind = "follow-up" if item["target_id"] else "new"
+            log(
+                f"  - {kind} {pr['full_name']}#{pr['number']}: "
+                f'{"; ".join(item["reasons"])}'
+            )
         save_state(state)
         log("DRY RUN complete (check-only; no completion callback)")
         return
@@ -634,26 +863,33 @@ def main() -> None:
         from openhands.tools.preset.default import get_default_agent  # noqa: PLC0415
 
         agent = get_default_agent(llm=llm, cli_mode=True)
-        dispatch_count = 0
-        if not to_dispatch:
+        engaged = 0
+        if not plan:
             log("no PRs require attention this run")
         else:
-            for pr, reasons in to_dispatch:
+            for item in plan:
+                pr = item["pr"]
                 key = f"{pr['full_name']}#{pr['number']}"
                 rec = prs[key]
                 try:
-                    conv_id = dispatch_in_workspace(
-                        workspace, agent, pr, reasons, token
+                    conv_id = engage_in_workspace(
+                        workspace,
+                        agent,
+                        pr,
+                        item["reasons"],
+                        token,
+                        target_id=item["target_id"],
                     )
-                    rec.setdefault("conv_ids", []).append(conv_id)
+                    if conv_id not in rec.setdefault("conv_ids", []):
+                        rec["conv_ids"].append(conv_id)
                     rec["attempts"] = rec.get("attempts", 0) + 1
                     rec["last_dispatched_at"] = now
                     rec["needs_human"] = None
-                    dispatch_count += 1
+                    engaged += 1
                 except Exception as exc:  # noqa: BLE001
-                    log(f"failed to dispatch {key}: {exc}")
-                    # Do not count it as an attempt; it never started.
-            log(f"started {dispatch_count} fix conversation(s)")
+                    log(f"failed to engage {key}: {exc}")
+                    # Do not count it as an attempt; it never ran.
+            log(f"engaged {engaged} fix conversation(s)")
         # Persist state BEFORE the workspace exits so that the completion
         # callback (fired on __exit__) reflects durable, up-to-date state.
         save_state(state)
