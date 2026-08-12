@@ -1,0 +1,81 @@
+Drive the pull request described above to merge-ready by running the /iterate loop.
+You are the orchestration loop: poll each verification layer, fix code, push, and
+re-poll — you only stop when every *present* layer is green, or a genuine blocker
+requires a human.
+
+## Environment
+
+- `GITHUB_TOKEN` is exported in the environment; authenticate `gh` with it
+  (e.g. `echo $GITHUB_TOKEN | gh auth login --with-token`) if not already authenticated.
+- The repository is NOT pre-cloned. Clone it yourself, check out the PR's head branch,
+  and create a short-lived local work branch off it for any edits you push:
+  `git clone https://github.com/{full_name}.git`, then
+  `git fetch origin pull/{number}/head:pr-branch` or `git checkout {head_ref}`.
+- Never commit to `main`/`master`; push fixes only to the PR's head branch.
+
+## Discover which verification layers this repo actually has
+
+Run `gh workflow list --json name -q '.[].name'` and `.github/workflows/*.yml` to see
+what is configured. A "present" layer means one of:
+- **CI checks** — `gh pr checks` returns results.
+- **Automated PR review** — a workflow like `pr-review` / "PR Review" exists.
+- **QA bot** — a workflow like `qa-changes` / "QA" exists.
+
+Your "all passed" condition is: every *present* layer is green on the current head SHA.
+Do not block on layers that don't exist. Also check for any existing unresolved review
+threads right away — open pending feedback must not be missed.
+
+## The loop
+
+1. Poll every present layer (see below).
+2. If a fix is needed, make the minimal fix, commit, push to the PR head branch,
+   re-request review from the review bots (`gh pr comment`, and request
+   `all-hands-bot`/`openhands` reviewers via the GitHub API), then go back to 1.
+3. If a layer is still pending, sleep ~60s and re-poll (back off exponentially to a
+   1h cap when green-but-waiting; reset whenever anything changes).
+4. If CI turns all-green for the current SHA, that is worth one celebratory log line,
+   then continue watching the other layers.
+
+## How to read each layer
+
+- **CI**: `gh pr checks --json name,state,bucket -q '...'`. Zip failed==0 and
+  pending==0 ⇒ green. Inspect failures with `gh run list --commit <sha> --status
+  failure` and `gh run view <id> --log-failed`.
+  - *Branch-related* (fix the code): compile/lint/typecheck in files you touched,
+    deterministic test failures in changed areas, snapshot/static-analysis violations.
+  - *Flaky/unrelated* (rerun, max 3 reruns per SHA): network/DNS/registry timeouts,
+    runner provisioning failures, infra errors, non-deterministic failures in code you
+    didn't touch. If ambiguous, inspect logs once before choosing.
+- **Review**: `gh pr view --json reviews` — filter to reviewers (OWNER/MEMBER/
+  COLLABORATOR or ``openhands``/``all-hands-bot``). `APPROVED` ⇒ passed;
+  `CHANGES_REQUESTED` ⇒ read the body and inline comments, fix code;
+  `COMMENTED` ⇒ decide if actionable, fix if so. List inline comments with
+  `gh api repos/{full_name}/pulls/{number}/comments`.
+- **QA**: `gh api repos/{full_name}/issues/{number}/comments` — a comment containing
+  `Status: PASS` ⇒ passed; `FAIL`/`PARTIAL` ⇒ fix per the report.
+
+## Review comment handling
+
+For every actionable review thread: fix the code, commit, push, then reply to the
+thread referencing the commit SHA, and resolve the thread via the GitHub GraphQL API.
+For non-actionable or already-addressed comments, reply briefly and resolve. Do not
+leave threads dangling. Before finishing, verify zero unresolved threads remain.
+
+## Stop conditions
+
+Stop only when:
+- Every present layer is green on the current head SHA — then report success and stop.
+- You hit a **genuine blocker you cannot fix** — permissions, infrastructure/CI
+  outage, a flaky failure that survived your 3-rerun budget, or ambiguity that cannot
+  be resolved safely. In that case **do NOT keep looping**. Leave one concise comment
+  on the PR beginning with `[iterate-watchdog] block: <short reason>`, then stop.
+- The PR is merged or closed.
+
+Pushing a fix is NOT a stop condition — keep going. Do not ask the user whether to
+continue; act autonomously until a stop condition is met.
+
+## Output
+
+End your final message with a terse summary:
+PR status (green / blocker reason), how many fixes you pushed, how many review threads
+you resolved, and the remaining failures or comments (or "none").

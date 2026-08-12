@@ -1,0 +1,16 @@
+enabled: false
+entrypoint: .venv/bin/python main.py
+keep_alive: null
+model: null
+name: Neubig Iterate Watchdog
+preset_metadata: null
+prompt: null
+setup_script_path: setup.sh
+tarball_source:
+  type: internal
+  url: null
+timeout: 600
+trigger:
+  schedule: 0 * * * *
+  timezone: UTC
+  type: cron
