@@ -582,47 +582,104 @@ def _workspace_ctx():
     )
 
 
-def engage_in_workspace(
-    workspace,
-    agent,
+def _agent_server_request(
+    method: str,
+    path: str,
+    *,
+    payload: dict | None = None,
+    acceptable_statuses: set[int] | None = None,
+) -> tuple[int, dict | None]:
+    """Issue one lightweight agent-server REST request."""
+    url, key = _agent_server()
+    if not url or not key:
+        raise RuntimeError("AGENT_SERVER_URL / SESSION_API_KEY not available")
+    body = json.dumps(payload).encode() if payload is not None else None
+    headers = {
+        "X-Session-API-Key": key,
+        "ngrok-skip-browser-warning": "1",
+        "Connection": "close",
+    }
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url + path, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            return resp.status, json.loads(raw.decode()) if raw else None
+    except urllib.error.HTTPError as exc:
+        if acceptable_statuses and exc.code in acceptable_statuses:
+            raw = exc.read()
+            return exc.code, json.loads(raw.decode()) if raw else None
+        raise
+
+
+def engage_direct(
     pr: dict,
     reasons: list[str],
     token: str,
     *,
     target_id: str | None = None,
+    agent_payload: dict | None = None,
+    workspace_dir: str,
 ) -> str:
-    """Start (or follow up on) an async fix conversation for a PR.
+    """Create/follow-up without hydrating historical events or opening a WS.
 
-    * ``target_id is None``: create a brand-new conversation, tagged with
-      ``iterate`` and ``iterate:{org}/{repo}#{number}``, and kick it off.
-    * ``target_id`` set: re-attach to that existing conversation and send it a
-      follow-up message instead of creating a duplicate.
-
-    Returns the conversation id. ``send_message`` alone only enqueues with
-    ``run: False``, so ``run`` with ``blocking=False`` is required to trigger
-    execution on the agent server and return immediately — the conversation keeps
-    running after this run exits.
+    Constructing SDK ``RemoteConversation`` objects for existing conversations
+    performs a full REST event sync, a reconciliation sync, and starts a
+    WebSocket. The watchdog only needs to update secrets, enqueue one message,
+    and trigger execution, so direct REST avoids downloading the entire history
+    twice per follow-up and avoids keeping one WS per engagement alive until the
+    automation process exits.
     """
-    from openhands.sdk import Conversation  # noqa: PLC0415
-
     tags = conversation_tags(pr)
-    conversation = Conversation(
-        agent=agent,
-        workspace=workspace,
-        delete_on_close=False,  # keep history visible in the UI
-        conversation_id=target_id,  # None => create a new conversation
-        tags=tags,  # only applied at creation; harmless on an attach
+    if target_id is None:
+        if agent_payload is None:
+            raise ValueError("agent_payload is required when creating a conversation")
+        _, info = _agent_server_request(
+            "POST",
+            "/api/conversations",
+            payload={
+                "agent": agent_payload,
+                "initial_message": None,
+                "max_iterations": 500,
+                "workspace": {"working_dir": workspace_dir, "kind": "LocalWorkspace"},
+                "tags": tags,
+                "autotitle": True,
+            },
+        )
+        if not info or not info.get("id"):
+            raise RuntimeError("agent server create response omitted conversation id")
+        conv_id = str(info["id"])
+    else:
+        conv_id = target_id
+
+    _agent_server_request(
+        "POST",
+        f"/api/conversations/{conv_id}/secrets",
+        payload={"secrets": {"GITHUB_TOKEN": token}},
     )
-    conversation.update_secrets({"GITHUB_TOKEN": token})
     prompt = build_prompt(pr, reasons)
     action = "following up on" if target_id else "dispatching fix for"
     log(
         f"{action} conversation for {pr['full_name']}#{pr['number']} "
-        f"(id={conversation.id}, tags={tags})"
+        f"(id={conv_id}, tags={tags})"
     )
-    conversation.send_message(prompt)
-    conversation.run(blocking=False, timeout=30)
-    conv_id = str(conversation.id)  # conversation.id is a UUID; store as str for JSON state
+    _agent_server_request(
+        "POST",
+        f"/api/conversations/{conv_id}/events",
+        payload={
+            "role": "user",
+            "content": [{"type": "text", "text": prompt}],
+            "run": False,
+        },
+    )
+    status, _ = _agent_server_request(
+        "POST",
+        f"/api/conversations/{conv_id}/run",
+        acceptable_statuses={409},
+    )
+    if status == 409:
+        log(f"conversation {conv_id} is already running; follow-up queued")
     log(
         f"{'engaged' if target_id else 'started'} conversation {conv_id} "
         f"(fire-and-forget; still running on the agent server after this run exits)"
@@ -866,6 +923,7 @@ def main() -> None:
         from openhands.tools.preset.default import get_default_agent  # noqa: PLC0415
 
         agent = get_default_agent(llm=llm, cli_mode=True)
+        agent_payload = agent.model_dump(mode="json", context={"expose_secrets": True})
         engaged = 0
         if not plan:
             log("no PRs require attention this run")
@@ -875,13 +933,13 @@ def main() -> None:
                 key = f"{pr['full_name']}#{pr['number']}"
                 rec = prs[key]
                 try:
-                    conv_id = engage_in_workspace(
-                        workspace,
-                        agent,
+                    conv_id = engage_direct(
                         pr,
                         item["reasons"],
                         token,
                         target_id=item["target_id"],
+                        agent_payload=agent_payload,
+                        workspace_dir=workspace.working_dir,
                     )
                     if conv_id not in rec.setdefault("conv_ids", []):
                         rec["conv_ids"].append(conv_id)
