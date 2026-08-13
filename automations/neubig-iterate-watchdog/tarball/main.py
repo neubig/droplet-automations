@@ -44,6 +44,12 @@ On every run:
   and leave a ``[iterate-watchdog] block: ...`` comment when it hits something it
   cannot fix (permissions, infra outage, flaky budget exhausted, ambiguity), instead
   of looping forever.
+- *Human-approval marker.* When a PR is genuinely gated on a human decision (design/
+  scope call, review only a person can adjudicate, a required approval), the agent
+  posts a comment containing the exact phrase ``needs human approval`` and stops.
+  The watchdog then skips any PR whose LAST issue comment contains that phrase, so a
+  parked PR is not re-engaged every hour until the marker is displaced by a human
+  reply (then it is picked back up if it still needs work).
 - *Draft PRs are skipped.* A draft is explicitly not meant to be merge-ready yet.
 - *Merged/closed PRs* fall out of the ``is:open`` query automatically.
 
@@ -85,6 +91,15 @@ MAX_ATTEMPTS_PER_SHA = int(os.environ.get("ITERATE_MAX_ATTEMPTS_PER_SHA", "3"))
 MAX_OPEN_CONVERSATIONS = int(
     os.environ.get("ITERATE_MAX_OPEN_CONVERSATIONS", "8")
 )
+
+# PR-comment marker that a dispatched agent must post when a PR is genuinely
+# blocked on a human — a decision or approval the agent cannot make on its own
+# (e.g. a design call, a review that needs a person to weigh in, an ambiguous
+# requirement). The watchdog skips any PR whose LAST issue comment contains this
+# phrase: the ball is in a person's court, so the PR is not re-engaged every hour.
+# Once a human replies (reviews, comments, pushes), the marker falls out of the
+# last-comment position and the watchdog picks the PR back up if it still needs work.
+HUMAN_APPROVAL_MARKER = os.environ.get("ITERATE_HUMAN_APPROVAL_MARKER", "needs human approval")
 
 # Batch size for targeted conversation lookups. The agent-server's batch-get
 # endpoint accepts fewer than 100 ids; chunking keeps request URLs and response
@@ -347,6 +362,30 @@ def pr_attention_reasons(
         reasons.append(f"{unresolved} unresolved review thread(s)")
 
     return bool(reasons), reasons
+
+
+def waiting_on_human(full_name: str, number: int, token: str) -> bool:
+    """True if the PR's last issue comment explicitly asks for human approval.
+
+    A dispatched agent signals that it hit a genuine human-blocker by posting a
+    comment containing ``HUMAN_APPROVAL_MARKER`` on the PR and then stopping (see
+    ``prompt.txt``). When that marker is the last thing written on the PR, the ball
+    is in a person's court, so the watchdog skips re-engaging it on subsequent runs.
+    As soon as a human replies (review, comment, or push), the marker falls out of the
+    last-comment position and the PR is picked up again if it still needs work.
+
+    Uses the issue-comments endpoint sorted newest-first so we only fetch/compute
+    the most recent comment, not the whole thread.
+    """
+    comments = gh_json(
+        f"{_GH_API}/repos/{full_name}/issues/{number}/comments"
+        "?sort=created&direction=desc&per_page=1",
+        token,
+    )
+    if not comments:
+        return False
+    last_body = (comments[0] or {}).get("body", "") or ""
+    return HUMAN_APPROVAL_MARKER.lower() in last_body.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -734,6 +773,16 @@ def main() -> None:
         base_repo = ((meta.get("base") or {}).get("repo") or {}).get("full_name")
         if base_repo:
             full_name = base_repo
+
+        # A PR whose last comment asks a human for approval is deliberately parked:
+        # the agent posted `HUMAN_APPROVAL_MARKER` and stopped, so we must not keep
+        # re-engaging it until a person replies. Skip before any /iterate analysis.
+        if waiting_on_human(full_name, number, token):
+            log(
+                f"skip {full_name}#{number}: waiting on human "
+                f"(last comment requests approval)"
+            )
+            continue
 
         needs, reasons = pr_attention_reasons(
             full_name, number, GITHUB_AUTHOR, head_sha, token

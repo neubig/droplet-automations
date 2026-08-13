@@ -69,6 +69,13 @@ Stop only when:
   outage, a flaky failure that survived your 3-rerun budget, or ambiguity that cannot
   be resolved safely. In that case **do NOT keep looping**. Leave one concise comment
   on the PR beginning with `[iterate-watchdog] block: <short reason>`, then stop.
+- The PR needs a **human decision you cannot make** — a design/scope call, a review
+  request that only a person can adjudicate, or any approval required to proceed that
+  no amount of code edits can satisfy. In that case leave a short comment on the PR
+  that contains the exact phrase `needs human approval` (verbatim, in its own sentence)
+  explaining what is needed, then stop. This signals the watchdog to park the PR so it
+  is not re-engaged every hour. Do NOT post this phrase for anything an AI fix could
+  resolve — only for a genuine human-gated decision.
 - The PR is merged or closed.
 
 Pushing a fix is NOT a stop condition — keep going. Do not ask the user whether to
