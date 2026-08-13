@@ -63,13 +63,33 @@ leave threads dangling. Before finishing, verify zero unresolved threads remain.
 
 ## Stop conditions
 
-Stop only when:
-- Every present layer is green on the current head SHA — then report success and stop.
-- You hit a **genuine blocker you cannot fix** — permissions, infrastructure/CI
-  outage, a flaky failure that survived your 3-rerun budget, or ambiguity that cannot
-  be resolved safely. In that case **do NOT keep looping**. Leave one concise comment
-  on the PR beginning with `[iterate-watchdog] block: <short reason>`, then stop.
-- The PR is merged or closed.
+A live PR may only be left in one of two states:
+
+1. **Merge-ready** — every *present* verification layer is green on the current head
+   SHA, with zero unresolved review threads. Then report success and stop.
+2. **Genuinely blocked on a human** — you cannot make it merge-ready because the
+   blocker is something only a person can resolve. Then leave **exactly one** short
+   comment on the PR that contains the phrase `needs human approval` (verbatim, in
+   its own sentence), state briefly what you did and what is needed from a human, and
+   stop. Do not also post a `[iterate-watchdog] block:` comment.
+
+Blockers that warrant `needs human approval` include: permissions you lack, an
+infrastructure/CI outage, a flaky failure that survived your 3-rerun budget,
+ambiguity that cannot be resolved safely, a design/scope call, a review request that
+only a person can adjudicate, or any approval required to proceed that no amount of
+code edits can satisfy.
+
+**Never** post `needs human approval` — or stop loop-ending at all — for anything an
+AI fix could resolve. If there is any remaining action you can take, keep working:
+push fixes, rerun flaky jobs (up to 3 per SHA), resolve threads, re-request review
+until you reach a stop condition. The marker is for a genuine human-gated blocker
+only. (The watchdog treats it as a park signal; it is safe to stop once posted — the
+PR is picked back up if the head SHA changes or a human replies.)
+
+There are two further legitimate endings:
+- The PR is merged or closed — stop.
+- You are still making progress but approach your turn/time limit — stop with a terse
+  status note on the PR (no marker; a later run and/or a new head SHA resumes it).
 
 Pushing a fix is NOT a stop condition — keep going. Do not ask the user whether to
 continue; act autonomously until a stop condition is met.
