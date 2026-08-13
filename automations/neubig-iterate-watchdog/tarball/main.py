@@ -86,12 +86,10 @@ MAX_OPEN_CONVERSATIONS = int(
     os.environ.get("ITERATE_MAX_OPEN_CONVERSATIONS", "8")
 )
 
-# Hard deadline (seconds) for the whole agent-server conversation listing. The
-# agent server builds full info per conversation and can be slow when it has
-# accumulated many; bounding the listing keeps an unresponsive search from
-# stalling (and eventually timing out) the whole run. On deadline the listing
-# raises and the watchdog falls back to its state-recorded conversation ids.
-LISTING_DEADLINE = int(os.environ.get("ITERATE_LISTING_DEADLINE", "90"))
+# Batch size for targeted conversation lookups. The agent-server's batch-get
+# endpoint accepts fewer than 100 ids; chunking keeps request URLs and response
+# bodies bounded while avoiding the expensive full-catalog search endpoint.
+CONVERSATION_BATCH_SIZE = int(os.environ.get("ITERATE_CONVERSATION_BATCH_SIZE", "50"))
 
 # GitHub check-run conclusions that mean "this PR is not merge-ready".
 FAILURE_CONCLUSIONS = {
@@ -463,47 +461,54 @@ def _agent_server() -> tuple[str, str]:
     return url, key
 
 
-def list_agent_conversations() -> list[dict]:
-    """Page through every conversation on the agent server.
+def known_conversation_ids(prs: dict) -> list[str]:
+    """Return unique conversation ids already recorded in durable KV state."""
+    seen: set[str] = set()
+    ids: list[str] = []
+    for record in prs.values():
+        for conversation_id in record.get("conv_ids", []):
+            value = str(conversation_id)
+            if value and value not in seen:
+                seen.add(value)
+                ids.append(value)
+    return ids
 
-    Returns a list of ``{"id", "status", "tags"}`` records so the watchdog can
-    (a) count how many of its /iterate conversations are currently open and
-    (b) find an already-existing conversation tagged with a PR's identity, both
-    to avoid duplicate dispatches and to send follow-ups instead.
 
-    If the agent server (or session key) is unavailable this raises, and the
-    caller falls back to per-Id state checks.
+def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
+    """Batch-get only the conversations this watchdog previously created.
+
+    The prior implementation paged through the agent server's *entire*
+    conversation catalog (100 full ``ConversationInfo`` objects per page) to
+    rediscover the ids already persisted in this automation's KV state. On a
+    server with hundreds of conversations, that competes directly with the UI
+    sidebar's conversation search and can stall it for tens of seconds.
+
+    The batch endpoint returns the same full info for specified ids only. Missing
+    or deleted conversations are returned as null and ignored.
     """
     url, key = _agent_server()
     if not url or not key:
         raise RuntimeError("AGENT_SERVER_URL / SESSION_API_KEY not available")
+    if not conversation_ids:
+        return []
 
     records: list[dict] = []
-    deadline = time.time() + LISTING_DEADLINE
-    page_id: str | None = None
-    while True:
-        if time.time() > deadline:
-            raise TimeoutError(
-                f"conversation listing exceeded {LISTING_DEADLINE}s deadline "
-                f"(failed mid-pagination at {len(records)} records)"
-            )
-        query = "limit=100"
-        if page_id:
-            query += f"&page_id={urllib.parse.quote(page_id)}"
+    for offset in range(0, len(conversation_ids), CONVERSATION_BATCH_SIZE):
+        batch = conversation_ids[offset : offset + CONVERSATION_BATCH_SIZE]
+        query = urllib.parse.urlencode({"ids": batch}, doseq=True)
         req = urllib.request.Request(
-            f"{url}/api/conversations/search?{query}",
+            f"{url}/api/conversations?{query}",
             headers={
                 "X-Session-API-Key": key,
                 "ngrok-skip-browser-warning": "1",
-                # Don't reuse a keep-alive socket: an upstream that is slow to
-                # build a page would otherwise swallow the socket timeout below
-                # and let the whole run hang until its own process timeout.
                 "Connection": "close",
             },
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-        for it in data.get("items", []):
+        for it in data:
+            if not it:
+                continue
             status = it.get("execution_status")
             if isinstance(status, dict):
                 status = status.get("value") or status.get("name")
@@ -514,9 +519,6 @@ def list_agent_conversations() -> list[dict]:
                     "tags": it.get("tags") or {},
                 }
             )
-        page_id = data.get("next_page_id")
-        if not page_id:
-            break
     return records
 
 
@@ -713,7 +715,8 @@ def main() -> None:
     iterate_open = 0  # number of open (non-terminal) /iterate conversations
     identity_ids: dict[str, list[str]] = {}  # iterate identity tag -> [conv ids]
     try:
-        conv_listing = list_agent_conversations()
+        recorded_ids = known_conversation_ids(prs)
+        conv_listing = get_known_agent_conversations(recorded_ids)
         for c in conv_listing:
             conv_index[c["id"]] = c
             tagged = TAG_FLAG in (c["tags"] or {})
@@ -723,11 +726,11 @@ def main() -> None:
             if identity and tagged:
                 identity_ids.setdefault(identity, []).append(c["id"])
         log(
-            f"agent server: {len(conv_listing)} conversation(s) total, "
-            f"{iterate_open} open /iterate conversation(s)"
+            f"agent server: checked {len(recorded_ids)} recorded conversation id(s), "
+            f"found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
         )
     except Exception as exc:  # noqa: BLE001 - tag dedup unavailable
-        log(f"could not list agent conversations ({exc}); falling back to state")
+        log(f"could not get recorded agent conversations ({exc}); falling back to state")
 
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
     plan: list[dict] = []  # {action, pr, reasons, target_id}
