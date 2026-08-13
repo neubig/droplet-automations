@@ -71,7 +71,7 @@ from pathlib import Path
 GITHUB_AUTHOR = os.environ.get("ITERATE_GITHUB_AUTHOR", "neubig")
 GITHUB_SEARCH_QUERY = f"author:{GITHUB_AUTHOR} type:pr is:open"
 
-# How many PR fix conversations may be started in a single run.
+# How many PR fix conversations (new starts or follow-ups) may be engaged in a single run.
 MAX_PER_RUN = int(os.environ.get("ITERATE_MAX_PER_RUN", "4"))
 
 # Max fix dispatch attempts before a given head SHA is considered un-actionable.
@@ -792,7 +792,7 @@ def main() -> None:
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
     plan: list[dict] = []  # {action, pr, reasons, target_id}
     open_used = iterate_open  # running tally; both starts and follow-ups consume a slot
-    new_started = 0  # how many brand-new conversations we've queued this run
+    engagements_planned = 0  # new starts + follow-ups queued this run
 
     for pr, reasons in candidates:
         key = f"{pr['full_name']}#{pr['number']}"
@@ -856,6 +856,14 @@ def main() -> None:
             log(f"skip {key}: fix conversation already in flight ({active[0]})")
             continue
 
+        # The user-facing per-run cap applies to all work launched by this
+        # automation. Previously only brand-new conversations incremented it,
+        # so six follow-ups plus two new starts could fan out eight agents even
+        # with MAX_PER_RUN=4.
+        if engagements_planned >= MAX_PER_RUN:
+            log(f"skip {key}: already engaging {MAX_PER_RUN} this run")
+            continue
+
         if known_ids:
             # (2b) A tagged conversation exists but is not running: send it a
             # follow-up message instead of creating a new conversation.
@@ -869,6 +877,7 @@ def main() -> None:
                 }
             )
             open_used += 1
+            engagements_planned += 1
             log(
                 f"FOLLOW-UP {key}: re-engaging conversation {target_id} "
                 f"({'; '.join(reasons)})"
@@ -877,9 +886,6 @@ def main() -> None:
 
         # No existing conversation for this PR: start a new one, subject to the
         # per-run cap and the global cap on open /iterate conversations.
-        if new_started >= MAX_PER_RUN:
-            log(f"skip {key}: already starting {MAX_PER_RUN} this run")
-            continue
         if open_used >= MAX_OPEN_CONVERSATIONS:
             log(
                 f"skip {key}: already at {MAX_OPEN_CONVERSATIONS} open /iterate "
@@ -889,7 +895,7 @@ def main() -> None:
         plan.append(
             {"action": "new", "pr": pr, "reasons": reasons, "target_id": None}
         )
-        new_started += 1
+        engagements_planned += 1
         open_used += 1
         log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
 
