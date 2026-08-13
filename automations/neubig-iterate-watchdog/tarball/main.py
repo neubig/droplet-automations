@@ -561,6 +561,77 @@ def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
     return records
 
 
+def all_iterate_conversations() -> list[dict]:
+    """Page the agent server and return every ``iterate``-tagged conversation.
+
+    The identity tag (``iterepo`` = ``iterate:{org}/{repo}#{number}``) is stable for
+    a PR even as its head changes, unlike this automation's durable KV state, whose
+    per-PR ``conv_ids`` are reset on head changes / pod restarts. Scanning the
+    catalog by tag is therefore the authoritative dedup source: it rediscovers an
+    existing conversation for a PR regardless of whether its id is still recorded
+    in state, so the watchdog follows up on it instead of creating a duplicate.
+    """
+    url, key = _agent_server()
+    if not url or not key:
+        raise RuntimeError("AGENT_SERVER_URL / SESSION_API_KEY not available")
+
+    out: list[dict] = []
+    page = None
+    while True:
+        query = "limit=100" + (("&page_id=" + str(page)) if page else "")
+        req = urllib.request.Request(
+            f"{url}/api/conversations/search?{query}",
+            headers={
+                "X-Session-API-Key": key,
+                "ngrok-skip-browser-warning": "1",
+                "Connection": "close",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        for it in data.get("items", []):
+            tags = it.get("tags") or {}
+            if TAG_FLAG not in tags:
+                continue
+            status = it.get("execution_status")
+            if isinstance(status, dict):
+                status = status.get("value") or status.get("name")
+            out.append(
+                {
+                    "id": str(it.get("id")),
+                    "status": str(status).lower() if status else "",
+                    "tags": tags,
+                }
+            )
+        page = data.get("next_page_id")
+        if not page:
+            break
+    return out
+
+
+def _index_iterate_conversations(
+    listing: list[dict],
+) -> tuple[dict, dict[str, list[str]], int]:
+    """Build dedup indexes from a conversation listing.
+
+    Returns ``(conv_index, identity_ids, iterate_open)`` where ``identity_ids`` maps
+    each ``iterate:{org}/{repo}#{number}`` identity to its conversation ids and
+    ``iterate_open`` counts the currently-active ``iterate`` conversations.
+    """
+    conv_index: dict[str, dict] = {}
+    identity_ids: dict[str, list[str]] = {}
+    iterate_open = 0
+    for c in listing:
+        conv_index[c["id"]] = c
+        tagged = TAG_FLAG in (c["tags"] or {})
+        if c["status"] in OPEN_STATUSES and tagged:
+            iterate_open += 1
+        identity = (c["tags"] or {}).get(TAG_TARGET)
+        if identity and tagged:
+            identity_ids.setdefault(identity, []).append(c["id"])
+    return conv_index, identity_ids, iterate_open
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
@@ -821,22 +892,31 @@ def main() -> None:
     iterate_open = 0  # number of open (non-terminal) /iterate conversations
     identity_ids: dict[str, list[str]] = {}  # iterate identity tag -> [conv ids]
     try:
-        recorded_ids = known_conversation_ids(prs)
-        conv_listing = get_known_agent_conversations(recorded_ids)
-        for c in conv_listing:
-            conv_index[c["id"]] = c
-            tagged = TAG_FLAG in (c["tags"] or {})
-            if c["status"] in OPEN_STATUSES and tagged:
-                iterate_open += 1
-            identity = (c["tags"] or {}).get(TAG_TARGET)
-            if identity and tagged:
-                identity_ids.setdefault(identity, []).append(c["id"])
-        log(
-            f"agent server: checked {len(recorded_ids)} recorded conversation id(s), "
-            f"found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
+        # Authoritative dedup: scan the catalog for every conversation tagged with
+        # this PR's identity. This finds existing conversations even when their id
+        # is no longer recorded in KV state (which resets on head changes/pods).
+        conv_listing = all_iterate_conversations()
+        conv_index, identity_ids, iterate_open = _index_iterate_conversations(
+            conv_listing
         )
-    except Exception as exc:  # noqa: BLE001 - tag dedup unavailable
-        log(f"could not get recorded agent conversations ({exc}); falling back to state")
+        log(
+            f"agent server: found {len(conv_listing)} iterate conversation(s), "
+            f"{iterate_open} open /iterate conversation(s)"
+        )
+    except Exception as exc:  # noqa: BLE001 - fall back to recorded-ids batch get
+        log(f"could not scan iterate conversations ({exc}); falling back to recorded ids")
+        try:
+            recorded_ids = known_conversation_ids(prs)
+            conv_listing = get_known_agent_conversations(recorded_ids)
+            conv_index, identity_ids, iterate_open = _index_iterate_conversations(
+                conv_listing
+            )
+            log(
+                f"agent server: checked {len(recorded_ids)} recorded conversation "
+                f"id(s), found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
+            )
+        except Exception as exc2:  # noqa: BLE001 - tag dedup unavailable
+            log(f"could not get recorded agent conversations ({exc2}); dedup by state only")
 
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
     plan: list[dict] = []  # {action, pr, reasons, target_id}
@@ -848,11 +928,13 @@ def main() -> None:
         rec = prs.get(key, {})
         prior_sha = rec.get("head_sha")
         if prior_sha != pr["head_sha"]:
-            # New head: fresh set of attempts, clear the human-escalation marker.
+            # New head: fresh set of attempts and clear the human-escalation marker,
+            # but KEEP the tracked conversation ids so identity-tag dedup still sees
+            # the existing conversation and follows up instead of creating a duplicate.
             prs[key] = {
                 "head_sha": pr["head_sha"],
                 "attempts": 0,
-                "conv_ids": [],
+                "conv_ids": [cid for cid in (rec or {}).get("conv_ids", [])] or [],
                 "needs_human": None,
             }
             rec = prs[key]
