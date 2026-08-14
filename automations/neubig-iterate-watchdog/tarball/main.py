@@ -44,7 +44,8 @@ On every run:
   and leave a ``[iterate-watchdog] block: ...`` comment when it hits something it
   cannot fix (permissions, infra outage, flaky budget exhausted, ambiguity), instead
   of looping forever.
-- *Draft PRs are skipped.* A draft is explicitly not meant to be merge-ready yet.
+- *Draft PRs* are now included — the agent iterates on them like any other PR
+  and converts them to ready-for-review once all acceptance criteria are met.
 - *Merged/closed PRs* fall out of the ``is:open`` query automatically.
 
 State is kept in the per-automation KV store (with a local-file fallback for
@@ -537,6 +538,17 @@ def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
 def build_prompt(pr: dict, reasons: list[str]) -> str:
     base = (_SCRIPT_DIR / "prompt.txt").read_text()
     context = "\n".join(f"- {r}" for r in reasons) or "- (fresh check; inspect PR)"
+    draft_note = ""
+    if pr.get("draft"):
+        draft_note = """
+- **This is a DRAFT PR.** Iterate on it the same as a non-draft PR — fix CI,
+  resolve conflicts, address review feedback. When ALL acceptance criteria are
+  met (CI green, no merge conflicts, no unresolved review threads), convert the
+  PR from draft to ready-for-review using:
+  `gh pr ready {pr['number']} --repo {pr['full_name']}`
+  Only do this once every present verification layer is green. If a genuine
+  blocker remains, leave it as draft and report the blocker.
+"""
     return f"""## Target PR
 
 - Repository: {pr['full_name']}
@@ -546,7 +558,7 @@ def build_prompt(pr: dict, reasons: list[str]) -> str:
 - Base branch: {pr['base_ref']}
 - Head SHA: {pr['head_sha']}
 - URL: {pr['url']}
-
+{draft_note}
 ## Current blockers surfaced by the watchdog
 
 {context}
@@ -728,9 +740,6 @@ def main() -> None:
         meta = gh_json(f"{_GH_API}/repos/{full_name}/pulls/{number}", token)
         if not meta or meta.get("state") != "open":
             continue
-        if meta.get("draft"):
-            log(f"skip {full_name}#{number}: draft")
-            continue
 
         head = meta.get("head") or {}
         head_sha = head.get("sha", "")
@@ -760,6 +769,7 @@ def main() -> None:
             "base_ref": base_ref,
             "head_sha": head_sha,
             "mergeable_state": mergeable_state,
+            "draft": bool(meta.get("draft")),
             "url": item.get("html_url", f"{_GH_API}/repos/{full_name}/pulls/{number}"),
             "updated_at": item.get("updated_at", ""),
         }
