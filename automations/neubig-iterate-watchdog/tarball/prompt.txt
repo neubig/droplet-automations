@@ -23,7 +23,9 @@ what is configured. A "present" layer means one of:
 
 Your "all passed" condition is: every *present* layer is green on the current head SHA.
 Do not block on layers that don't exist. Also check for any existing unresolved review
-threads right away — open pending feedback must not be missed.
+threads right away — but only threads opened by an **allowlisted reviewer** (the QA bot
+`all-hands-bot` and the PR author by default; configure the list via `ITERATE_REVIEW_AUTHORS`).
+Threads opened by other human reviewers are out of scope: do not block on or act on them.
 
 ## The loop
 
@@ -48,18 +50,23 @@ threads right away — open pending feedback must not be missed.
     didn't touch. If ambiguous, inspect logs once before choosing.
 - **Review**: `gh pr view --json reviews` — filter to reviewers (OWNER/MEMBER/
   COLLABORATOR or ``openhands``/``all-hands-bot``). `APPROVED` ⇒ passed;
-  `CHANGES_REQUESTED` ⇒ read the body and inline comments, fix code;
-  `COMMENTED` ⇒ decide if actionable, fix if so. List inline comments with
+  `CHANGES_REQUESTED` ⇒ read the body and inline comments, fix code. Only act on
+  inline review **comments/threads authored by an allowlisted reviewer** (`all-hands-bot`
+  and the PR author by default, configurable via `ITERATE_REVIEW_AUTHORS`); ignore threads
+  opened by other reviewers. List inline comments with
   `gh api repos/{full_name}/pulls/{number}/comments`.
 - **QA**: `gh api repos/{full_name}/issues/{number}/comments` — a comment containing
   `Status: PASS` ⇒ passed; `FAIL`/`PARTIAL` ⇒ fix per the report.
 
 ## Review comment handling
 
-For every actionable review thread: fix the code, commit, push, then reply to the
+Only handle review threads whose first comment is from an **allowlisted reviewer**
+(`all-hands-bot` and the PR author by default; configure via `ITERATE_REVIEW_AUTHORS`).
+For every actionable allowlisted thread: fix the code, commit, push, then reply to the
 thread referencing the commit SHA, and resolve the thread via the GitHub GraphQL API.
-For non-actionable or already-addressed comments, reply briefly and resolve. Do not
-leave threads dangling. Before finishing, verify zero unresolved threads remain.
+For non-actionable or already-addressed allowlisted comments, reply briefly and resolve.
+Threads opened by other reviewers are out of scope — leave them untouched and do not
+block on them. Before finishing, verify zero unresolved allowlisted threads remain.
 
 ## Stop conditions
 
@@ -77,5 +84,5 @@ continue; act autonomously until a stop condition is met.
 ## Output
 
 End your final message with a terse summary:
-PR status (green / blocker reason), how many fixes you pushed, how many review threads
-you resolved, and the remaining failures or comments (or "none").
+PR status (green / blocker reason), how many fixes you pushed, how many allowlisted
+review threads you resolved, and the remaining failures or comments (or "none").
