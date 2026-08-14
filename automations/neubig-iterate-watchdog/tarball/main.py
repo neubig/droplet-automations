@@ -44,12 +44,6 @@ On every run:
   and leave a ``[iterate-watchdog] block: ...`` comment when it hits something it
   cannot fix (permissions, infra outage, flaky budget exhausted, ambiguity), instead
   of looping forever.
-- *Human-approval marker.* When a PR is genuinely gated on a human decision (design/
-  scope call, review only a person can adjudicate, a required approval), the agent
-  posts a comment containing the exact phrase ``needs human approval`` and stops.
-  The watchdog then skips any PR whose LAST issue comment contains that phrase, so a
-  parked PR is not re-engaged every hour until the marker is displaced by a human
-  reply (then it is picked back up if it still needs work).
 - *Draft PRs are skipped.* A draft is explicitly not meant to be merge-ready yet.
 - *Merged/closed PRs* fall out of the ``is:open`` query automatically.
 
@@ -77,7 +71,7 @@ from pathlib import Path
 GITHUB_AUTHOR = os.environ.get("ITERATE_GITHUB_AUTHOR", "neubig")
 GITHUB_SEARCH_QUERY = f"author:{GITHUB_AUTHOR} type:pr is:open"
 
-# How many PR fix conversations (new starts or follow-ups) may be engaged in a single run.
+# How many PR fix conversations may be started in a single run.
 MAX_PER_RUN = int(os.environ.get("ITERATE_MAX_PER_RUN", "4"))
 
 # Max fix dispatch attempts before a given head SHA is considered un-actionable.
@@ -91,15 +85,6 @@ MAX_ATTEMPTS_PER_SHA = int(os.environ.get("ITERATE_MAX_ATTEMPTS_PER_SHA", "3"))
 MAX_OPEN_CONVERSATIONS = int(
     os.environ.get("ITERATE_MAX_OPEN_CONVERSATIONS", "8")
 )
-
-# PR-comment marker that a dispatched agent must post when a PR is genuinely
-# blocked on a human — a decision or approval the agent cannot make on its own
-# (e.g. a design call, a review that needs a person to weigh in, an ambiguous
-# requirement). The watchdog skips any PR whose LAST issue comment contains this
-# phrase: the ball is in a person's court, so the PR is not re-engaged every hour.
-# Once a human replies (reviews, comments, pushes), the marker falls out of the
-# last-comment position and the watchdog picks the PR back up if it still needs work.
-HUMAN_APPROVAL_MARKER = os.environ.get("ITERATE_HUMAN_APPROVAL_MARKER", "needs human approval")
 
 # Batch size for targeted conversation lookups. The agent-server's batch-get
 # endpoint accepts fewer than 100 ids; chunking keeps request URLs and response
@@ -323,6 +308,7 @@ def pr_attention_reasons(
     author: str,
     head_sha: str,
     token: str,
+    mergeable_state: str | None = None,
 ) -> tuple[bool, list[str]]:
     """Return (needs_attention, reasons) for a single PR.
 
@@ -331,6 +317,13 @@ def pr_attention_reasons(
     configured) is treated as passing, mirroring /iterate.
     """
     reasons: list[str] = []
+
+    # --- Merge conflict ----------------------------------------------------
+    # `mergeable_state="dirty"` means the branch can't merge until its
+    # conflicts are resolved. This was previously invisible to the watchdog,
+    # so a conflicting-but-green-CI PR was never flagged for /iterate.
+    if mergeable_state == "dirty":
+        reasons.append("merge conflict (mergeable_state=dirty)")
 
     # --- CI checks on the head commit -------------------------------------
     checks = gh_json(
@@ -362,30 +355,6 @@ def pr_attention_reasons(
         reasons.append(f"{unresolved} unresolved review thread(s)")
 
     return bool(reasons), reasons
-
-
-def waiting_on_human(full_name: str, number: int, token: str) -> bool:
-    """True if the PR's last issue comment explicitly asks for human approval.
-
-    A dispatched agent signals that it hit a genuine human-blocker by posting a
-    comment containing ``HUMAN_APPROVAL_MARKER`` on the PR and then stopping (see
-    ``prompt.txt``). When that marker is the last thing written on the PR, the ball
-    is in a person's court, so the watchdog skips re-engaging it on subsequent runs.
-    As soon as a human replies (review, comment, or push), the marker falls out of the
-    last-comment position and the PR is picked up again if it still needs work.
-
-    Uses the issue-comments endpoint sorted newest-first so we only fetch/compute
-    the most recent comment, not the whole thread.
-    """
-    comments = gh_json(
-        f"{_GH_API}/repos/{full_name}/issues/{number}/comments"
-        "?sort=created&direction=desc&per_page=1",
-        token,
-    )
-    if not comments:
-        return False
-    last_body = (comments[0] or {}).get("body", "") or ""
-    return HUMAN_APPROVAL_MARKER.lower() in last_body.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -559,77 +528,6 @@ def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
                 }
             )
     return records
-
-
-def all_iterate_conversations() -> list[dict]:
-    """Page the agent server and return every ``iterate``-tagged conversation.
-
-    The identity tag (``iterepo`` = ``iterate:{org}/{repo}#{number}``) is stable for
-    a PR even as its head changes, unlike this automation's durable KV state, whose
-    per-PR ``conv_ids`` are reset on head changes / pod restarts. Scanning the
-    catalog by tag is therefore the authoritative dedup source: it rediscovers an
-    existing conversation for a PR regardless of whether its id is still recorded
-    in state, so the watchdog follows up on it instead of creating a duplicate.
-    """
-    url, key = _agent_server()
-    if not url or not key:
-        raise RuntimeError("AGENT_SERVER_URL / SESSION_API_KEY not available")
-
-    out: list[dict] = []
-    page = None
-    while True:
-        query = "limit=100" + (("&page_id=" + str(page)) if page else "")
-        req = urllib.request.Request(
-            f"{url}/api/conversations/search?{query}",
-            headers={
-                "X-Session-API-Key": key,
-                "ngrok-skip-browser-warning": "1",
-                "Connection": "close",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-        for it in data.get("items", []):
-            tags = it.get("tags") or {}
-            if TAG_FLAG not in tags:
-                continue
-            status = it.get("execution_status")
-            if isinstance(status, dict):
-                status = status.get("value") or status.get("name")
-            out.append(
-                {
-                    "id": str(it.get("id")),
-                    "status": str(status).lower() if status else "",
-                    "tags": tags,
-                }
-            )
-        page = data.get("next_page_id")
-        if not page:
-            break
-    return out
-
-
-def _index_iterate_conversations(
-    listing: list[dict],
-) -> tuple[dict, dict[str, list[str]], int]:
-    """Build dedup indexes from a conversation listing.
-
-    Returns ``(conv_index, identity_ids, iterate_open)`` where ``identity_ids`` maps
-    each ``iterate:{org}/{repo}#{number}`` identity to its conversation ids and
-    ``iterate_open`` counts the currently-active ``iterate`` conversations.
-    """
-    conv_index: dict[str, dict] = {}
-    identity_ids: dict[str, list[str]] = {}
-    iterate_open = 0
-    for c in listing:
-        conv_index[c["id"]] = c
-        tagged = TAG_FLAG in (c["tags"] or {})
-        if c["status"] in OPEN_STATUSES and tagged:
-            iterate_open += 1
-        identity = (c["tags"] or {}).get(TAG_TARGET)
-        if identity and tagged:
-            identity_ids.setdefault(identity, []).append(c["id"])
-    return conv_index, identity_ids, iterate_open
 
 
 # --------------------------------------------------------------------------- #
@@ -845,18 +743,14 @@ def main() -> None:
         if base_repo:
             full_name = base_repo
 
-        # A PR whose last comment asks a human for approval is deliberately parked:
-        # the agent posted `HUMAN_APPROVAL_MARKER` and stopped, so we must not keep
-        # re-engaging it until a person replies. Skip before any /iterate analysis.
-        if waiting_on_human(full_name, number, token):
-            log(
-                f"skip {full_name}#{number}: waiting on human "
-                f"(last comment requests approval)"
-            )
-            continue
-
+        mergeable_state = str(meta.get("mergeable_state") or "")
         needs, reasons = pr_attention_reasons(
-            full_name, number, GITHUB_AUTHOR, head_sha, token
+            full_name,
+            number,
+            GITHUB_AUTHOR,
+            head_sha,
+            token,
+            mergeable_state=mergeable_state,
         )
         pr = {
             "full_name": full_name,
@@ -865,6 +759,7 @@ def main() -> None:
             "head_ref": head_ref,
             "base_ref": base_ref,
             "head_sha": head_sha,
+            "mergeable_state": mergeable_state,
             "url": item.get("html_url", f"{_GH_API}/repos/{full_name}/pulls/{number}"),
             "updated_at": item.get("updated_at", ""),
         }
@@ -892,49 +787,38 @@ def main() -> None:
     iterate_open = 0  # number of open (non-terminal) /iterate conversations
     identity_ids: dict[str, list[str]] = {}  # iterate identity tag -> [conv ids]
     try:
-        # Authoritative dedup: scan the catalog for every conversation tagged with
-        # this PR's identity. This finds existing conversations even when their id
-        # is no longer recorded in KV state (which resets on head changes/pods).
-        conv_listing = all_iterate_conversations()
-        conv_index, identity_ids, iterate_open = _index_iterate_conversations(
-            conv_listing
-        )
+        recorded_ids = known_conversation_ids(prs)
+        conv_listing = get_known_agent_conversations(recorded_ids)
+        for c in conv_listing:
+            conv_index[c["id"]] = c
+            tagged = TAG_FLAG in (c["tags"] or {})
+            if c["status"] in OPEN_STATUSES and tagged:
+                iterate_open += 1
+            identity = (c["tags"] or {}).get(TAG_TARGET)
+            if identity and tagged:
+                identity_ids.setdefault(identity, []).append(c["id"])
         log(
-            f"agent server: found {len(conv_listing)} iterate conversation(s), "
-            f"{iterate_open} open /iterate conversation(s)"
+            f"agent server: checked {len(recorded_ids)} recorded conversation id(s), "
+            f"found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
         )
-    except Exception as exc:  # noqa: BLE001 - fall back to recorded-ids batch get
-        log(f"could not scan iterate conversations ({exc}); falling back to recorded ids")
-        try:
-            recorded_ids = known_conversation_ids(prs)
-            conv_listing = get_known_agent_conversations(recorded_ids)
-            conv_index, identity_ids, iterate_open = _index_iterate_conversations(
-                conv_listing
-            )
-            log(
-                f"agent server: checked {len(recorded_ids)} recorded conversation "
-                f"id(s), found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
-            )
-        except Exception as exc2:  # noqa: BLE001 - tag dedup unavailable
-            log(f"could not get recorded agent conversations ({exc2}); dedup by state only")
+    except Exception as exc:  # noqa: BLE001 - tag dedup unavailable
+        log(f"could not get recorded agent conversations ({exc}); falling back to state")
 
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
     plan: list[dict] = []  # {action, pr, reasons, target_id}
     open_used = iterate_open  # running tally; both starts and follow-ups consume a slot
-    engagements_planned = 0  # new starts + follow-ups queued this run
+    new_started = 0  # how many brand-new conversations we've queued this run
 
     for pr, reasons in candidates:
         key = f"{pr['full_name']}#{pr['number']}"
         rec = prs.get(key, {})
         prior_sha = rec.get("head_sha")
         if prior_sha != pr["head_sha"]:
-            # New head: fresh set of attempts and clear the human-escalation marker,
-            # but KEEP the tracked conversation ids so identity-tag dedup still sees
-            # the existing conversation and follows up instead of creating a duplicate.
+            # New head: fresh set of attempts, clear the human-escalation marker.
             prs[key] = {
                 "head_sha": pr["head_sha"],
                 "attempts": 0,
-                "conv_ids": [cid for cid in (rec or {}).get("conv_ids", [])] or [],
+                "conv_ids": [],
                 "needs_human": None,
             }
             rec = prs[key]
@@ -987,14 +871,6 @@ def main() -> None:
             log(f"skip {key}: fix conversation already in flight ({active[0]})")
             continue
 
-        # The user-facing per-run cap applies to all work launched by this
-        # automation. Previously only brand-new conversations incremented it,
-        # so six follow-ups plus two new starts could fan out eight agents even
-        # with MAX_PER_RUN=4.
-        if engagements_planned >= MAX_PER_RUN:
-            log(f"skip {key}: already engaging {MAX_PER_RUN} this run")
-            continue
-
         if known_ids:
             # (2b) A tagged conversation exists but is not running: send it a
             # follow-up message instead of creating a new conversation.
@@ -1008,7 +884,6 @@ def main() -> None:
                 }
             )
             open_used += 1
-            engagements_planned += 1
             log(
                 f"FOLLOW-UP {key}: re-engaging conversation {target_id} "
                 f"({'; '.join(reasons)})"
@@ -1017,6 +892,9 @@ def main() -> None:
 
         # No existing conversation for this PR: start a new one, subject to the
         # per-run cap and the global cap on open /iterate conversations.
+        if new_started >= MAX_PER_RUN:
+            log(f"skip {key}: already starting {MAX_PER_RUN} this run")
+            continue
         if open_used >= MAX_OPEN_CONVERSATIONS:
             log(
                 f"skip {key}: already at {MAX_OPEN_CONVERSATIONS} open /iterate "
@@ -1026,7 +904,7 @@ def main() -> None:
         plan.append(
             {"action": "new", "pr": pr, "reasons": reasons, "target_id": None}
         )
-        engagements_planned += 1
+        new_started += 1
         open_used += 1
         log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
 
