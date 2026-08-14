@@ -29,8 +29,12 @@ On every run:
   already exists for a PR:
     - it is **running** (``ACTIVE_STATUSES``) → the watchdog skips it, so two agents
       never fight over the same branch;
-    - it is **not running** → the watchdog sends the existing conversation a follow-up
-      message instead of creating a new one.
+    - it is **alive** (``idle`` or ``finished``) but not running → the watchdog sends
+      the existing conversation a follow-up message instead of creating a new one;
+    - it has **errored/stuck** (``FAILED_STATUSES``) → the run died, so the watchdog
+      retries the PR with a **fresh conversation** rather than poking a dead run.
+      A failed attempt is not terminal: only ``MAX_ERROR_TRIES`` consecutive
+      failures with no ``finished`` run in between park the PR as ``needs_human``.
   A fallback to the state-recorded ``conv_ids`` is kept for conversations created
   before tagging was introduced.
 - *Attempt budget.* A PR is dispatched at most ``MAX_ATTEMPTS_PER_SHA`` times per head
@@ -124,6 +128,16 @@ OPEN_STATUSES = {
     *ACTIVE_STATUSES,
     "idle",  # created, ready to receive tasks
 }
+
+# A conversation that errored or got stuck is a *failed attempt*, not a terminal
+# result: the run died without completing, so its PR must not be treated as done
+# (or left to a dead conversation that can't make progress). We retry such a PR
+# with a fresh conversation, and only after MAX_ERROR_TRIES consecutive failures
+# with no successful (``finished``) run in between is it parked as needing a
+# human.
+FAILED_STATUSES = {"error", "stuck"}
+SUCCESS_STATUS = "finished"
+MAX_ERROR_TRIES = int(os.environ.get("ITERATE_MAX_ERROR_TRIES", "3"))
 
 # Conversation tags. Every conversation this watchdog starts (or follows up on)
 # gets two tags:
@@ -817,7 +831,7 @@ def main() -> None:
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
     plan: list[dict] = []  # {action, pr, reasons, target_id}
     open_used = iterate_open  # running tally; both starts and follow-ups consume a slot
-    new_started = 0  # how many brand-new conversations we've queued this run
+    engagements_planned = 0  # new starts + follow-ups queued this run
 
     for pr, reasons in candidates:
         key = f"{pr['full_name']}#{pr['number']}"
@@ -830,6 +844,7 @@ def main() -> None:
                 "attempts": 0,
                 "conv_ids": [],
                 "needs_human": None,
+                "consecutive_errors": 0,
             }
             rec = prs[key]
 
@@ -881,10 +896,74 @@ def main() -> None:
             log(f"skip {key}: fix conversation already in flight ({active[0]})")
             continue
 
-        if known_ids:
-            # (2b) A tagged conversation exists but is not running: send it a
-            # follow-up message instead of creating a new conversation.
-            target_id = known_ids[-1]
+        # The user-facing per-run cap applies to all work launched by this
+        # automation. Previously only brand-new conversations incremented it,
+        # so six follow-ups plus two new starts could fan out eight agents even
+        # with MAX_PER_RUN=4.
+        if engagements_planned >= MAX_PER_RUN:
+            log(f"skip {key}: already engaging {MAX_PER_RUN} this run")
+            continue
+
+        # A failed (errored/stuck) conversation is a *recoverable* attempt, not
+        # a terminal result: its run died, so the PR must not be treated as done.
+        # We retry it with a fresh conversation, and only give up (needs_human)
+        # after MAX_ERROR_TRIES consecutive failures with no successful
+        # (``finished``) run in between.
+        failed_ids: list[str] = []
+        if conv_listing is not None:
+            statuses = [
+                conv_index.get(cid, {}).get("status", "") for cid in known_ids
+            ]
+            succeeded = any(s == SUCCESS_STATUS for s in statuses)
+            failed_ids = [
+                cid for cid, s in zip(known_ids, statuses)
+                if s in FAILED_STATUSES
+            ]
+            if succeeded:
+                rec["consecutive_errors"] = 0
+            elif failed_ids:
+                if key not in prs:
+                    prs[key] = {
+                        "head_sha": pr["head_sha"],
+                        "attempts": 0,
+                        "conv_ids": [],
+                        "needs_human": None,
+                        "consecutive_errors": 0,
+                    }
+                    rec = prs[key]
+                rec["consecutive_errors"] = (
+                    rec.get("consecutive_errors", 0) + 1
+                )
+                if rec["consecutive_errors"] >= MAX_ERROR_TRIES:
+                    rec["needs_human"] = {
+                        "reason": (
+                            f"{rec['consecutive_errors']} consecutive errors "
+                            f"with no successful run on head "
+                            f"{pr['head_sha'][:7]}; cannot auto-fix"
+                        ),
+                        "at": now,
+                    }
+                    log(
+                        f"skip {key}: {rec['consecutive_errors']} consecutive "
+                        f"errors without progress; flagged for human review"
+                    )
+                    continue
+
+        # Workable retry targets are conversations that are alive (idle) or
+        # finished — send them a follow-up. A failed conversation is dead, so it
+        # is deliberately excluded: retrying it means starting fresh, not poking
+        # an errored run that can't make progress.
+        if conv_listing is not None:
+            retry_targets = [
+                cid for cid in known_ids
+                if conv_index.get(cid, {}).get("status") not in FAILED_STATUSES
+            ]
+        else:
+            retry_targets = known_ids
+
+        if retry_targets:
+            # (2b) A tagged conversation is alive but not running: follow up.
+            target_id = retry_targets[-1]
             plan.append(
                 {
                     "action": "follow_up",
@@ -894,17 +973,16 @@ def main() -> None:
                 }
             )
             open_used += 1
+            engagements_planned += 1
             log(
                 f"FOLLOW-UP {key}: re-engaging conversation {target_id} "
                 f"({'; '.join(reasons)})"
             )
             continue
 
-        # No existing conversation for this PR: start a new one, subject to the
-        # per-run cap and the global cap on open /iterate conversations.
-        if new_started >= MAX_PER_RUN:
-            log(f"skip {key}: already starting {MAX_PER_RUN} this run")
-            continue
+        # Only failed (or no) conversations remain: start a fresh retry,
+        # subject to the per-run cap and the global cap on open /iterate
+        # conversations.
         if open_used >= MAX_OPEN_CONVERSATIONS:
             log(
                 f"skip {key}: already at {MAX_OPEN_CONVERSATIONS} open /iterate "
@@ -914,9 +992,15 @@ def main() -> None:
         plan.append(
             {"action": "new", "pr": pr, "reasons": reasons, "target_id": None}
         )
-        new_started += 1
+        engagements_planned += 1
         open_used += 1
-        log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
+        if failed_ids:
+            log(
+                f"RETRY {key}: fresh conversation after errored attempt "
+                f"({'; '.join(reasons)})"
+            )
+        else:
+            log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
 
     # 3. Engage (start / follow up on) fix conversations.
     dry_run = os.environ.get("ITERATE_DRY_RUN", "") == "1"
