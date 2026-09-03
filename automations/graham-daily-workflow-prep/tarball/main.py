@@ -73,6 +73,40 @@ import json
 import os
 import sys
 import time
+import urllib.request
+
+
+def fetch_linear_snapshot(secrets: dict) -> str:
+    """Fetch assigned Linear issues before creating the agent conversation."""
+    raw_keys = secrets.get("LINEAR_API_KEYS") or secrets.get("LINEAR_API_KEY")
+    keys = (
+        list(dict.fromkeys(key.strip() for key in raw_keys.split(",") if key.strip()))
+        if isinstance(raw_keys, str)
+        else []
+    )
+    if not keys:
+        return "## Pre-fetched Linear snapshot\nNo configured Linear credentials were available."
+
+    query = '''query { viewer { assignedIssues(first: 250, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) { nodes { id identifier title priority priorityLabel state { name type } labels { nodes { name } } url createdAt updatedAt dueDate } } } }'''
+    connections = []
+    for index, key in enumerate(keys, start=1):
+        request = urllib.request.Request(
+            "https://api.linear.app/graphql",
+            data=json.dumps({"query": query}).encode(),
+            headers={"Content-Type": "application/json", "Authorization": key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+            if payload.get("errors"):
+                connections.append({"connection": index, "error": payload["errors"][0].get("message", "GraphQL error")})
+            else:
+                viewer = payload.get("data", {}).get("viewer", {})
+                connections.append({"connection": index, "issues": viewer.get("assignedIssues", {}).get("nodes", [])})
+        except Exception as exc:
+            connections.append({"connection": index, "error": f"fetch failed: {type(exc).__name__}"})
+    return "## Pre-fetched Linear snapshot\nUse this read-only snapshot for the initial Linear queue. Targeted reads may still be used when needed.\n\n```json\n" + json.dumps({"connections": connections}, indent=2) + "\n```"
 
 # Detect execution mode based on AGENT_SERVER_URL presence
 agent_server_url = os.environ.get("AGENT_SERVER_URL", "").rstrip("/")
@@ -240,33 +274,6 @@ with workspace_ctx as workspace:
     with open(PROMPT_FILE) as f:
         USER_PROMPT = f.read()
 
-    # Build prompt with context sections
-    context_sections = []
-
-    # Add repos context if repos were cloned
-    if repos_context:
-        context_sections.append(repos_context)
-
-    # Add event context if this is an event-triggered run
-    if event_context and "event" in event_context:
-        event_json = json.dumps(event_context["event"], indent=2)
-        context_sections.append(f"""## Event Payload
-
-This automation was triggered by a webhook event:
-
-```json
-{event_json}
-```""")
-
-    # Prepend context sections to the user prompt
-    if context_sections:
-        context_block = "\n\n".join(context_sections)
-        USER_PROMPT = f"""{context_block}
-
-## Task
-
-{USER_PROMPT}"""
-
     # Get LLM config via workspace/profile APIs
     print("\n=== GET_LLM ===")
     try:
@@ -293,6 +300,10 @@ This automation was triggered by a webhook event:
         # Not a hard failure — user may not have secrets configured
         print(f"  get_secrets() failed (ok if no secrets): {e}")
 
+    print("\n=== PREFETCH LINEAR ===")
+    linear_snapshot = fetch_linear_snapshot(secrets)
+    print("  fetched assigned Linear issues before conversation creation")
+
     # Get MCP config via workspace
     print("\n=== GET_MCP_CONFIG ===")
     mcp_config = None
@@ -318,6 +329,28 @@ This automation was triggered by a webhook event:
         agent_updates["agent_context"] = agent_context
     if agent_updates:
         agent = agent.model_copy(update=agent_updates)
+
+
+    # Build prompt with repository, event, and pre-fetched Linear context.
+    context_sections = []
+    if repos_context:
+        context_sections.append(repos_context)
+    context_sections.append(linear_snapshot)
+    if event_context and "event" in event_context:
+        event_json = json.dumps(event_context["event"], indent=2)
+        context_sections.append(f"""## Event Payload
+
+This automation was triggered by a webhook event:
+
+```json
+{event_json}
+```""")
+    context_block = "\n\n".join(context_sections)
+    USER_PROMPT = f"""{context_block}
+
+## Task
+
+{USER_PROMPT}"""
 
     print(f"  tools: {[t.name for t in agent.tools]}")
     print(f"  mcp_config: {'configured' if mcp_config else 'none'}")
