@@ -91,18 +91,7 @@ Do not create any Slack-derived tickets — only propose them.
 
 ## Step 6: Prioritize Unprioritized Linear Tickets
 
-Fetch Graham's incomplete, unblocked assigned Linear tickets with priority `0 No priority`. Use the Linear GraphQL API to exclude completed, canceled, and duplicate tickets:
-
-```bash
-curl -s -X POST https://api.linear.app/graphql \
-  -H "Content-Type: application/json" \
-  -H "Authorization: $LINEAR_API_KEY" \
-  -d '{
-    "query": "query { viewer { assignedIssues(first: 250, filter: { state: { type: { nin: [\"completed\", \"canceled\", \"duplicate\"] } } }) { nodes { id identifier title priority priorityLabel state { name type } labels { nodes { name } } url createdAt updatedAt dueDate } } } }"
-  }' | jq '.data.viewer.assignedIssues.nodes'
-```
-
-Alternatively, use Linear MCP `list_issues` with `assignee=me` and filter locally.
+Use the pre-fetched Linear snapshot supplied by the automation for the initial assigned-ticket inventory. It excludes completed, canceled, and duplicate tickets; filter blocked issues locally before reporting. Use targeted Linear reads only when the snapshot lacks required details.
 
 When active unprioritized tickets exist:
 1. Exclude completed, canceled, duplicate, archived, and blocked tickets.
