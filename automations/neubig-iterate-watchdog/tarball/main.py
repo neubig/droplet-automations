@@ -60,7 +60,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +95,12 @@ HUMAN_APPROVAL_MARKER = os.environ.get("ITERATE_HUMAN_APPROVAL_MARKER", "needs h
 # endpoint accepts fewer than 100 ids; chunking keeps request URLs and response
 # bodies bounded while avoiding the expensive full-catalog search endpoint.
 CONVERSATION_BATCH_SIZE = int(os.environ.get("ITERATE_CONVERSATION_BATCH_SIZE", "50"))
+
+# Agent-server status can remain ``running`` after an agent has returned its final
+# response. A lease prevents those stale records from occupying every slot forever.
+CONVERSATION_LEASE = timedelta(
+    seconds=int(os.environ.get("ITERATE_CONVERSATION_LEASE_SECONDS", "10800"))
+)
 
 # GitHub check-run conclusions that mean "this PR is not merge-ready".
 FAILURE_CONCLUSIONS = {
@@ -223,6 +229,15 @@ def get_secret(name: str) -> str:
 
 
 def github_token() -> str:
+    gh = subprocess.run(
+        ["gh", "auth", "token"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    token = gh.stdout.strip() if gh.returncode == 0 else ""
+    if token:
+        return token
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if token:
         return token
@@ -230,7 +245,7 @@ def github_token() -> str:
         return get_secret("GITHUB_TOKEN")
     except Exception as exc:
         raise RuntimeError(
-            "GITHUB_TOKEN not found in env or agent-server secrets "
+            "GitHub credential not found in gh, env, or agent-server secrets "
             f"(needed to query GitHub): {exc}"
         ) from exc
 
@@ -433,8 +448,8 @@ def pr_attention_reasons(
     return bool(reasons), reasons
 
 
-def waiting_on_human(full_name: str, number: int, token: str) -> bool:
-    """Return true only while a human-approval marker remains unacknowledged."""
+def waiting_on_human(full_name: str, number: int, token: str) -> str | None:
+    """Return the active human-approval marker body, if unacknowledged."""
     owner, _, repo = full_name.partition("/")
     query = """
     query($o: String!, $r: String!, $n: Int!) {
@@ -451,18 +466,19 @@ def waiting_on_human(full_name: str, number: int, token: str) -> bool:
     pr = ((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
     comments = ((pr.get("comments") or {}).get("nodes") or [])
     if not comments:
-        return False
+        return None
     marker = comments[-1] or {}
-    if HUMAN_APPROVAL_MARKER.lower() not in (marker.get("body") or "").lower():
-        return False
+    marker_body = marker.get("body") or ""
+    if HUMAN_APPROVAL_MARKER.lower() not in marker_body.lower():
+        return None
     marker_at = marker.get("createdAt") or ""
     for review in ((pr.get("reviews") or {}).get("nodes") or []):
         login = ((review.get("author") or {}).get("login") or "").lower()
         if login and login not in REVIEWER_BOT_LOGINS and (review.get("submittedAt") or "") > marker_at:
-            return False
+            return None
     commits = ((pr.get("commits") or {}).get("nodes") or [])
     committed_at = (((commits[-1] if commits else {}).get("commit") or {}).get("committedDate") or "")
-    return committed_at <= marker_at
+    return marker_body if committed_at <= marker_at else None
 
 
 # --------------------------------------------------------------------------- #
@@ -551,6 +567,87 @@ def save_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def effective_conversation_status(
+    conversation: dict, now: datetime | None = None
+) -> str:
+    status = str(conversation.get("status") or "").lower()
+    if status not in ACTIVE_STATUSES:
+        return status
+    updated_at = _parse_datetime(conversation.get("updated_at"))
+    current = now or datetime.now(timezone.utc)
+    if updated_at is not None and current - updated_at > CONVERSATION_LEASE:
+        return "stuck"
+    return status
+
+
+def _conversation_has_final_response(conversation_id: str) -> bool:
+    try:
+        _, data = _agent_server_request(
+            "GET", f"/api/conversations/{conversation_id}/agent_final_response"
+        )
+    except Exception:  # noqa: BLE001 - lease handling remains a safe fallback
+        return False
+    return bool(data and data.get("response"))
+
+
+def reconcile_conversation_status(conversation: dict) -> dict:
+    status = effective_conversation_status(conversation)
+    if status in ACTIVE_STATUSES and _conversation_has_final_response(conversation["id"]):
+        status = SUCCESS_STATUS
+    if status != conversation.get("status"):
+        log(
+            f"reconciled conversation {conversation['id']}: "
+            f"{conversation.get('status')} -> {status}"
+        )
+    return {**conversation, "status": status}
+
+
+def should_pause_for_human(marker_body: str | None, reasons: list[str]) -> bool:
+    if not marker_body:
+        return False
+    marker = marker_body.lower()
+    for reason in reasons:
+        lowered = reason.lower()
+        if lowered.startswith(("pr has merge conflicts", "pr branch is behind")):
+            return False
+        if lowered.startswith(("ci pending", "unresolved review thread")):
+            return False
+        if lowered.startswith("pr is still a draft") and not any(
+            phrase in marker for phrase in ("draft", "human:", "human-authored")
+        ):
+            return False
+        if lowered.startswith("ci failing"):
+            protected_description = "pr description check" in lowered and any(
+                phrase in marker for phrase in ("human:", "human-authored", "human-written")
+            )
+            if not protected_description:
+                return False
+    return True
+
+
+def candidate_priority(pr: dict, records: dict) -> tuple[str, str, str]:
+    record = records.get(f"{pr['full_name']}#{pr['number']}", {})
+    last_dispatched = record.get("last_dispatched_at") or ""
+    never_dispatched = "0" if not last_dispatched else "1"
+    return never_dispatched, last_dispatched, pr.get("updated_at") or ""
+
+
+def has_engagement_capacity(
+    open_used: int, open_limit: int, planned: int, per_run_limit: int
+) -> bool:
+    return open_used < open_limit and planned < per_run_limit
+
 # In-flight conversation detection
 # --------------------------------------------------------------------------- #
 
@@ -644,9 +741,10 @@ def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
                     "id": str(it.get("id")),
                     "status": str(status).lower() if status else "",
                     "tags": it.get("tags") or {},
+                    "updated_at": it.get("updated_at"),
                 }
             )
-    return records
+    return [reconcile_conversation_status(record) for record in records]
 
 
 def all_iterate_conversations() -> list[dict]:
@@ -689,12 +787,13 @@ def all_iterate_conversations() -> list[dict]:
                     "id": str(it.get("id")),
                     "status": str(status).lower() if status else "",
                     "tags": tags,
+                    "updated_at": it.get("updated_at"),
                 }
             )
         page = data.get("next_page_id")
         if not page:
             break
-    return out
+    return [reconcile_conversation_status(record) for record in out]
 
 
 def _index_iterate_conversations(
@@ -942,13 +1041,6 @@ def main() -> None:
             if base_repo:
                 full_name = base_repo
 
-            if waiting_on_human(full_name, number, token):
-                log(
-                    f"skip {full_name}#{number}: waiting on human "
-                    f"(last comment requests approval)"
-                )
-                continue
-
             needs, reasons = pr_attention_reasons(
                 full_name,
                 number,
@@ -960,6 +1052,18 @@ def main() -> None:
                 draft=bool(meta.get("draft")),
                 requested_reviewers=meta.get("requested_reviewers") or [],
             )
+            marker_body = waiting_on_human(full_name, number, token)
+            if should_pause_for_human(marker_body, reasons):
+                log(
+                    f"skip {full_name}#{number}: waiting on human "
+                    f"(current machine-verifiable layers remain clear)"
+                )
+                continue
+            if marker_body:
+                log(
+                    f"resume {full_name}#{number}: machine-verifiable state changed "
+                    f"despite prior human marker"
+                )
             pr = {
                 "full_name": full_name,
                 "number": number,
@@ -1029,7 +1133,7 @@ def main() -> None:
         except Exception as exc2:  # noqa: BLE001 - tag dedup unavailable
             log(f"could not get recorded agent conversations ({exc2}); dedup by state only")
 
-    candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
+    candidates.sort(key=lambda item: candidate_priority(item[0], prs))
     plan: list[dict] = []  # {action, pr, reasons, target_id}
     open_used = iterate_open  # running tally; both starts and follow-ups consume a slot
     engagements_planned = 0  # new starts + follow-ups queued this run
@@ -1079,12 +1183,19 @@ def main() -> None:
             log(f"skip {key}: fix conversation already in flight ({active[0]})")
             continue
 
-        # The user-facing per-run cap applies to all work launched by this
-        # automation. Previously only brand-new conversations incremented it,
-        # so six follow-ups plus two new starts could fan out eight agents even
-        # with MAX_PER_RUN=4.
-        if engagements_planned >= MAX_PER_RUN:
-            log(f"skip {key}: already engaging {MAX_PER_RUN} this run")
+        if not has_engagement_capacity(
+            open_used,
+            MAX_OPEN_CONVERSATIONS,
+            engagements_planned,
+            MAX_PER_RUN,
+        ):
+            if open_used >= MAX_OPEN_CONVERSATIONS:
+                log(
+                    f"skip {key}: already at {MAX_OPEN_CONVERSATIONS} open /iterate "
+                    f"conversations (MAX_OPEN_CONVERSATIONS)"
+                )
+            else:
+                log(f"skip {key}: already engaging {MAX_PER_RUN} this run")
             continue
 
         # Failed conversations are dead retry targets. Start fresh below rather
@@ -1190,6 +1301,7 @@ def main() -> None:
         agent = get_default_agent(llm=llm, cli_mode=True)
         agent_payload = agent.model_dump(mode="json", context={"expose_secrets": True})
         engaged = 0
+        engagement_errors: list[str] = []
         if not plan:
             log("no PRs require attention this run")
         else:
@@ -1212,12 +1324,16 @@ def main() -> None:
                     rec["last_dispatched_at"] = now
                     engaged += 1
                 except Exception as exc:  # noqa: BLE001
-                    log(f"failed to engage {key}: {exc}")
+                    message = f"failed to engage {key}: {exc}"
+                    log(message)
+                    engagement_errors.append(message)
                     # Do not count it as an attempt; it never ran.
             log(f"engaged {engaged} fix conversation(s)")
         # Persist state BEFORE the workspace exits so that the completion
         # callback (fired on __exit__) reflects durable, up-to-date state.
         save_state(state)
+        if engagement_errors:
+            raise RuntimeError("; ".join(engagement_errors))
         log("run complete")
     # WORKSPACE EXIT above fired the completion callback.
 
