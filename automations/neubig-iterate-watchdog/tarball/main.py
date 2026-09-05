@@ -628,10 +628,19 @@ def should_pause_for_human(marker_body: str | None, reasons: list[str]) -> bool:
         ):
             return False
         if lowered.startswith("ci failing"):
-            protected_description = "pr description check" in lowered and any(
+            check_names = lowered.rsplit(": ", 1)[-1].rstrip(")").split(", ")
+            description_only = all(
+                name in {"pr description check", "validate pr description"}
+                for name in check_names
+            )
+            protected_description = description_only and any(
                 phrase in marker for phrase in ("human:", "human-authored", "human-written")
             )
-            if not protected_description:
+            agent_fields_missing = any(
+                phrase in marker
+                for phrase in ("missing template sections", "missing agent", "missing how to test")
+            )
+            if not protected_description or agent_fields_missing:
                 return False
     return True
 

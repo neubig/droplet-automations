@@ -56,6 +56,18 @@ class HumanMarkerTests(unittest.TestCase):
         marker = "The HUMAN: section needs genuine human-written evidence. needs human approval"
         self.assertFalse(watchdog.should_pause_for_human(marker, reasons))
 
+    def test_mixed_description_and_title_failures_invalidate_marker(self):
+        reasons = [
+            "CI failing (2/7 current workflows: Validate PR description, pr-title / Lint PR title (conventional))"
+        ]
+        marker = "The HUMAN: section needs human-written evidence. needs human approval"
+        self.assertFalse(watchdog.should_pause_for_human(marker, reasons))
+
+    def test_missing_agent_owned_template_sections_invalidate_marker(self):
+        reasons = ["CI failing (1/7 current workflows: Validate PR description)"]
+        marker = "HUMAN text and missing template sections are required. needs human approval"
+        self.assertFalse(watchdog.should_pause_for_human(marker, reasons))
+
     def test_no_marker_never_pauses(self):
         self.assertFalse(watchdog.should_pause_for_human(None, ["review still requested from bot"]))
 
