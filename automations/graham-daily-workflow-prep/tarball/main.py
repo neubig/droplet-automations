@@ -75,39 +75,6 @@ import sys
 import time
 import urllib.request
 
-
-def fetch_linear_snapshot(secrets: dict) -> str:
-    """Fetch assigned Linear issues before creating the agent conversation."""
-    raw_keys = secrets.get("LINEAR_API_KEYS") or secrets.get("LINEAR_API_KEY")
-    keys = (
-        list(dict.fromkeys(key.strip() for key in raw_keys.split(",") if key.strip()))
-        if isinstance(raw_keys, str)
-        else []
-    )
-    if not keys:
-        return "## Pre-fetched Linear snapshot\nNo configured Linear credentials were available."
-
-    query = '''query { viewer { assignedIssues(first: 250, filter: { state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) { nodes { id identifier title priority priorityLabel state { name type } labels { nodes { name } } url createdAt updatedAt dueDate } } } }'''
-    connections = []
-    for index, key in enumerate(keys, start=1):
-        request = urllib.request.Request(
-            "https://api.linear.app/graphql",
-            data=json.dumps({"query": query}).encode(),
-            headers={"Content-Type": "application/json", "Authorization": key},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.load(response)
-            if payload.get("errors"):
-                connections.append({"connection": index, "error": payload["errors"][0].get("message", "GraphQL error")})
-            else:
-                viewer = payload.get("data", {}).get("viewer", {})
-                connections.append({"connection": index, "issues": viewer.get("assignedIssues", {}).get("nodes", [])})
-        except Exception as exc:
-            connections.append({"connection": index, "error": f"fetch failed: {type(exc).__name__}"})
-    return "## Pre-fetched Linear snapshot\nUse this read-only snapshot for the initial Linear queue. Targeted reads may still be used when needed.\n\n```json\n" + json.dumps({"connections": connections}, indent=2) + "\n```"
-
 # Detect execution mode based on AGENT_SERVER_URL presence
 agent_server_url = os.environ.get("AGENT_SERVER_URL", "").rstrip("/")
 IS_LOCAL_MODE = bool(agent_server_url)
@@ -128,6 +95,51 @@ session_key = (
 )
 model_profile = os.environ.get("AUTOMATION_MODEL") or None
 automation_user_id = os.environ.get("AUTOMATION_USER_ID") or None
+
+
+def fire_completion_callback(
+    status: str,
+    conversation_id: str | None = None,
+    error: str | None = None,
+    cost: float | None = None,
+) -> None:
+    """Send an explicit completion callback so the run record accurately
+    reflects the conversation outcome and links the conversation_id.
+
+    The workspace context-manager __exit__ also sends a callback, but only
+    if the process is still alive.  By firing the callback here — right
+    after the conversation finishes — we guarantee the run is updated even
+    if the process is killed shortly after (e.g. by a tight timeout).
+    """
+    url = os.environ.get("AUTOMATION_CALLBACK_URL", "")
+    if not url:
+        print("  (no AUTOMATION_CALLBACK_URL set, skipping explicit callback)")
+        return
+    run_id = os.environ.get("AUTOMATION_RUN_ID", "")
+    body: dict = {"status": status, "run_id": run_id}
+    if conversation_id:
+        body["conversation_id"] = conversation_id
+    if error:
+        body["error"] = error
+    if cost is not None:
+        body["cost"] = cost
+    headers: dict = {"Content-Type": "application/json"}
+    callback_api_key = os.environ.get("AUTOMATION_CALLBACK_API_KEY", "")
+    if callback_api_key:
+        headers["Authorization"] = f"Bearer {callback_api_key}"
+    elif session_key:
+        headers["X-Session-API-Key"] = session_key
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=headers
+        )
+        urllib.request.urlopen(req)
+        print(
+            f"  callback sent: status={status}"
+            f"{', conversation_id=' + conversation_id if conversation_id else ''}"
+        )
+    except Exception as e:
+        print(f"  callback failed (workspace __exit__ will retry): {e}")
 
 print("=== EXECUTION MODE ===")
 print(f"  mode: {'LOCAL' if IS_LOCAL_MODE else 'CLOUD'}")
@@ -274,6 +286,33 @@ with workspace_ctx as workspace:
     with open(PROMPT_FILE) as f:
         USER_PROMPT = f.read()
 
+    # Build prompt with context sections
+    context_sections = []
+
+    # Add repos context if repos were cloned
+    if repos_context:
+        context_sections.append(repos_context)
+
+    # Add event context if this is an event-triggered run
+    if event_context and "event" in event_context:
+        event_json = json.dumps(event_context["event"], indent=2)
+        context_sections.append(f"""## Event Payload
+
+This automation was triggered by a webhook event:
+
+```json
+{event_json}
+```""")
+
+    # Prepend context sections to the user prompt
+    if context_sections:
+        context_block = "\n\n".join(context_sections)
+        USER_PROMPT = f"""{context_block}
+
+## Task
+
+{USER_PROMPT}"""
+
     # Get LLM config via workspace/profile APIs
     print("\n=== GET_LLM ===")
     try:
@@ -299,10 +338,6 @@ with workspace_ctx as workspace:
     except Exception as e:
         # Not a hard failure — user may not have secrets configured
         print(f"  get_secrets() failed (ok if no secrets): {e}")
-
-    print("\n=== PREFETCH LINEAR ===")
-    linear_snapshot = fetch_linear_snapshot(secrets)
-    print("  fetched assigned Linear issues before conversation creation")
 
     # Get MCP config via workspace
     print("\n=== GET_MCP_CONFIG ===")
@@ -330,28 +365,6 @@ with workspace_ctx as workspace:
     if agent_updates:
         agent = agent.model_copy(update=agent_updates)
 
-
-    # Build prompt with repository, event, and pre-fetched Linear context.
-    context_sections = []
-    if repos_context:
-        context_sections.append(repos_context)
-    context_sections.append(linear_snapshot)
-    if event_context and "event" in event_context:
-        event_json = json.dumps(event_context["event"], indent=2)
-        context_sections.append(f"""## Event Payload
-
-This automation was triggered by a webhook event:
-
-```json
-{event_json}
-```""")
-    context_block = "\n\n".join(context_sections)
-    USER_PROMPT = f"""{context_block}
-
-## Task
-
-{USER_PROMPT}"""
-
     print(f"  tools: {[t.name for t in agent.tools]}")
     print(f"  mcp_config: {'configured' if mcp_config else 'none'}")
     print(f"  skills: {len(loaded_skills) if loaded_skills else 0}")
@@ -378,6 +391,7 @@ This automation was triggered by a webhook event:
     conversation = Conversation(**conversation_kwargs)
     assert isinstance(conversation, RemoteConversation)
     print(f"  conversation created: {type(conversation).__name__}")
+    print(f"  conversation ID: {conversation.id}")
 
     # Inject secrets into the conversation (auto-exported as env vars in bash)
     if secrets:
@@ -403,6 +417,18 @@ This automation was triggered by a webhook event:
         cost = conversation.conversation_stats.get_combined_metrics().accumulated_cost
         print(f"  cost: {cost}")
         print(f"  events received: {len(received_events)}")
+
+        # Fire explicit callback so the run record reflects the actual
+        # conversation outcome and links the conversation_id.
+        fire_completion_callback(
+            "COMPLETED", conversation_id=conversation.id, cost=cost
+        )
+    except Exception as e:
+        print(f"  conversation failed: {e}", file=sys.stderr)
+        fire_completion_callback(
+            "FAILED", conversation_id=conversation.id, error=str(e)
+        )
+        raise
     finally:
         conversation.close()
 

@@ -4,12 +4,12 @@
 On every run:
 
 1. **Check (deterministic, no LLM).** Poll the GitHub API for open PRs authored by
-   ``neubig`` and decide, per PR, whether the /iterate "merge-ready" conditions are
-   NOT satisfied:
-     - failing CI checks on the head commit,
+   ``neubig`` and decide, per PR, whether GitHub still reports work before merge:
+     - draft state, merge conflicts, a behind/blocked/unstable merge gate,
+     - a current failing or pending CI workflow,
      - a review still in ``CHANGES_REQUESTED`` state,
      - unresolved review threads awaiting a response.
-   Parsing the queries below costs no LLM tokens.
+   Historical workflow attempts superseded by a newer rerun are ignored.
 
 2. **Engage (LLM, deduplicated).** For PRs that need attention, the watchdog
    first snapshots the agent server's conversations (their tags and execution
@@ -29,34 +29,32 @@ On every run:
   already exists for a PR:
     - it is **running** (``ACTIVE_STATUSES``) → the watchdog skips it, so two agents
       never fight over the same branch;
-    - it is **not running** → the watchdog sends the existing conversation a follow-up
-      message instead of creating a new one.
+    - it is **alive** (``idle`` or ``finished``) but not running → the watchdog sends
+      the existing conversation a follow-up message instead of creating a new one;
+    - it has **errored/stuck** (``FAILED_STATUSES``) → the run died, so the watchdog
+      retries the PR with a **fresh conversation** rather than poking a dead run.
   A fallback to the state-recorded ``conv_ids`` is kept for conversations created
   before tagging was introduced.
-- *Attempt budget.* A PR is dispatched at most ``MAX_ATTEMPTS_PER_SHA`` times per head
-  SHA. Once exhausted the PR is marked ``needs_human`` and skipped until the head SHA
-  changes. This is the defence against genuinely unfixable CI: rather than spinning
-  every hour forever, the watchdog gives up after a bounded number of tries and
-  surfaces the PR for a person to unblock.
-- *Head-SHA reset.* When a PR's head SHA changes (a new push), its attempt count and
-  ``needs_human`` marker are cleared — new code earns a fresh set of attempts.
-- *Agent stop condition.* The dispatched agent is told (see ``prompt.txt``) to stop
-  and leave a ``[iterate-watchdog] block: ...`` comment when it hits something it
-  cannot fix (permissions, infra outage, flaky budget exhausted, ambiguity), instead
-  of looping forever.
-- *Draft PRs* are now included — the agent iterates on them like any other PR
-  and converts them to ready-for-review once all acceptance criteria are met.
+- *Continuous retries.* Prior failures never permanently park a PR. The hourly run
+  re-engages unfinished work while the per-run and global concurrency caps prevent
+  duplicate agents and runaway fan-out.
+- *Human-approval marker.* When a PR is genuinely gated on a human decision, the
+  agent posts a comment containing ``needs human approval`` and stops. The watchdog
+  pauses only until a later human review or commit acknowledges that marker.
+- *Draft PRs are candidates.* The agent can finish the work and decide whether the
+  draft is safe to mark ready for review.
 - *Merged/closed PRs* fall out of the ``is:open`` query automatically.
 
 State is kept in the per-automation KV store (with a local-file fallback for
-local/dev runs) so in-flight tracking, attempt budgets, and ``needs_human`` markers
-survive across runs on cloud pods.
+local/dev runs) so conversation identities survive across runs on cloud pods.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.error
@@ -72,22 +70,8 @@ from pathlib import Path
 GITHUB_AUTHOR = os.environ.get("ITERATE_GITHUB_AUTHOR", "neubig")
 GITHUB_SEARCH_QUERY = f"author:{GITHUB_AUTHOR} type:pr is:open"
 
-# Unresolved review threads are only treated as needing attention when their
-# first comment is from one of these logins. Defaults to the QA bot and the PR
-# author (threads opened by other human reviewers are deliberately ignored).
-REVIEW_AUTHORS = frozenset(
-    a.strip().lower()
-    for a in os.environ.get(
-        "ITERATE_REVIEW_AUTHORS", f"all-hands-bot,{GITHUB_AUTHOR}"
-    ).split(",")
-    if a.strip()
-)
-
-# How many PR fix conversations may be started in a single run.
+# How many PR fix conversations (new starts or follow-ups) may be engaged in a single run.
 MAX_PER_RUN = int(os.environ.get("ITERATE_MAX_PER_RUN", "4"))
-
-# Max fix dispatch attempts before a given head SHA is considered un-actionable.
-MAX_ATTEMPTS_PER_SHA = int(os.environ.get("ITERATE_MAX_ATTEMPTS_PER_SHA", "3"))
 
 # Upper bound on the number of simultaneously-open /iterate conversations. The
 # watchdog never lets more than this many of its conversations be in a non-
@@ -97,6 +81,15 @@ MAX_ATTEMPTS_PER_SHA = int(os.environ.get("ITERATE_MAX_ATTEMPTS_PER_SHA", "3"))
 MAX_OPEN_CONVERSATIONS = int(
     os.environ.get("ITERATE_MAX_OPEN_CONVERSATIONS", "8")
 )
+
+# PR-comment marker that a dispatched agent must post when a PR is genuinely
+# blocked on a human — a decision or approval the agent cannot make on its own
+# (e.g. a design call, a review that needs a person to weigh in, an ambiguous
+# requirement). The watchdog skips any PR whose LAST issue comment contains this
+# phrase: the ball is in a person's court, so the PR is not re-engaged every hour.
+# Once a human replies (reviews, comments, pushes), the marker falls out of the
+# last-comment position and the watchdog picks the PR back up if it still needs work.
+HUMAN_APPROVAL_MARKER = os.environ.get("ITERATE_HUMAN_APPROVAL_MARKER", "needs human approval")
 
 # Batch size for targeted conversation lookups. The agent-server's batch-get
 # endpoint accepts fewer than 100 ids; chunking keeps request URLs and response
@@ -136,6 +129,12 @@ OPEN_STATUSES = {
     "idle",  # created, ready to receive tasks
 }
 
+# Failed conversations are retried in a fresh conversation. A bounded global
+# concurrency cap prevents runaway fan-out; PRs themselves are never permanently
+# parked merely because earlier attempts failed.
+FAILED_STATUSES = {"error", "stuck"}
+SUCCESS_STATUS = "finished"
+
 # Conversation tags. Every conversation this watchdog starts (or follows up on)
 # gets two tags:
 #   "iterate"      -> marks the conversation as part of the /iterate automation
@@ -167,6 +166,34 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 def log(message: str) -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     print(f"[{now}] {message}", flush=True)
+
+
+def fire_callback(status: str = "COMPLETED", error: str | None = None) -> None:
+    """Signal run completion without constructing an SDK workspace."""
+    url = os.environ.get("AUTOMATION_CALLBACK_URL", "")
+    if not url:
+        return
+    body = {
+        "status": status,
+        "run_id": os.environ.get("AUTOMATION_RUN_ID", ""),
+    }
+    if error:
+        body["error"] = error
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": (
+                "Bearer " + os.environ.get("AUTOMATION_CALLBACK_API_KEY", "")
+            ),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001 - callback failure cannot be recovered here
+        log(f"callback error: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +257,13 @@ def gh_json(url: str, token: str, *, timeout: int = 30) -> object:
                 time.sleep(30)
                 last_exc = exc
                 continue
+            # Transient server errors: retry with backoff
+            if exc.code in (500, 502, 503, 504):
+                wait = 5 * (attempt + 1)
+                log(f"GitHub {exc.code} on {url}; retrying in {wait}s")
+                time.sleep(wait)
+                last_exc = exc
+                continue
             if exc.code == 404:
                 return None
             raise
@@ -261,33 +295,34 @@ def gh_graphql(query: str, variables: dict, token: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def _current_review_state(reviews: list[dict], author: str) -> str | None:
-    """Latest non-dismissed review authored by a reviewer (not the PR author)."""
-    latest: str | None = None
-    for r in reviews or []:
-        login = (r.get("user") or {}).get("login", "")
-        assoc = (r.get("author_association") or "")
-        is_reviewer = (
-            login in REVIEWER_BOT_LOGINS
-            or assoc in REVIEWER_AUTHOR_ASSOCIATIONS
-        )
-        if not is_reviewer or login == author:
+    """Aggregate each reviewer's latest authoritative review state."""
+    latest_by_reviewer: dict[str, str] = {}
+    for review in reviews or []:
+        login = (review.get("user") or {}).get("login", "")
+        association = review.get("author_association") or ""
+        if (
+            not login
+            or login == author
+            or review.get("dismissed")
+            or (
+                login.lower() not in REVIEWER_BOT_LOGINS
+                and association not in REVIEWER_AUTHOR_ASSOCIATIONS
+            )
+        ):
             continue
-        if r.get("dismissed"):
-            continue
-        latest = r.get("state") or latest
-    return latest
+        state = review.get("state")
+        if state in {"APPROVED", "CHANGES_REQUESTED"}:
+            latest_by_reviewer[login.lower()] = state
+    states = set(latest_by_reviewer.values())
+    if "CHANGES_REQUESTED" in states:
+        return "CHANGES_REQUESTED"
+    if "APPROVED" in states:
+        return "APPROVED"
+    return next(iter(states), None)
 
 
-def _unresolved_threads(
-    full_name: str,
-    number: int,
-    token: str,
-    review_authors: frozenset[str] | None = None,
-) -> int:
-    """Count unresolved review threads whose first comment is from an allowlisted
-    author (default ``REVIEW_AUTHORS``: the QA bot and the PR author). Threads
-    opened by other human reviewers are deliberately not counted."""
-    review_authors = review_authors if review_authors is not None else REVIEW_AUTHORS
+def _unresolved_threads(full_name: str, number: int, author: str, token: str) -> int:
+    """Count unresolved review threads whose first comment is from a reviewer."""
     owner, _, repo = full_name.partition("/")
     query = """
     query($o: String!, $r: String!, $n: Int!) {
@@ -317,7 +352,7 @@ def _unresolved_threads(
             continue
         first = ((t.get("comments") or {}).get("nodes") or [{}])[0]
         login = ((first.get("author")) or {}).get("login", "")
-        if login and login.lower() in review_authors:
+        if login and login != author:
             count += 1
     return count
 
@@ -328,53 +363,106 @@ def pr_attention_reasons(
     author: str,
     head_sha: str,
     token: str,
-    mergeable_state: str | None = None,
+    mergeable: object = None,
+    merge_state_status: str | None = None,
+    *,
+    draft: bool = False,
+    requested_reviewers: list[dict] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Return (needs_attention, reasons) for a single PR.
-
-    Uses the same signals as the /iterate skill: a PR is merge-ready when every
-    *present* verification layer is green. Absence of a layer (e.g. no CI checks
-    configured) is treated as passing, mirroring /iterate.
-    """
+    """Return whether a PR still needs work before GitHub can merge it."""
     reasons: list[str] = []
 
-    # --- Merge conflict ----------------------------------------------------
-    # `mergeable_state="dirty"` means the branch can't merge until its
-    # conflicts are resolved. This was previously invisible to the watchdog,
-    # so a conflicting-but-green-CI PR was never flagged for /iterate.
-    if mergeable_state == "dirty":
-        reasons.append("merge conflict (mergeable_state=dirty)")
+    if draft:
+        reasons.append("PR is still a draft")
 
-    # --- CI checks on the head commit -------------------------------------
-    checks = gh_json(
-        f"{_GH_API}/repos/{full_name}/commits/{head_sha}/check-runs?per_page=100",
+    merge_state = str(merge_state_status or "").lower()
+    if mergeable is False or merge_state in {"dirty", "conflicting"}:
+        reasons.append("PR has merge conflicts with its base branch")
+    elif merge_state == "behind":
+        reasons.append("PR branch is behind its base branch")
+    elif merge_state in {"blocked", "unstable", "has_hooks"}:
+        reasons.append(f"GitHub merge gate is {merge_state.upper()}")
+
+    # The Actions endpoint returns historical runs for a SHA. Keep only the newest
+    # run for each workflow so superseded failures do not trigger endless retries.
+    runs_resp = gh_json(
+        f"{_GH_API}/repos/{full_name}/actions/runs"
+        f"?head_sha={head_sha}&per_page=100",
         token,
     )
+    latest_runs: dict[object, dict] = {}
+    for run in (runs_resp or {}).get("workflow_runs", []):
+        workflow_key = run.get("workflow_id") or run.get("name") or run.get("id")
+        current = latest_runs.get(workflow_key)
+        if current is None or (run.get("created_at") or "") > (current.get("created_at") or ""):
+            latest_runs[workflow_key] = run
+
     failing_runs: list[str] = []
-    total_runs = (checks or {}).get("total_count", 0)
-    for run in (checks or {}).get("check_runs", []):
-        conclusion = run.get("conclusion") or run.get("status")
-        if conclusion in FAILURE_CONCLUSIONS:
-            failing_runs.append(run.get("name") or run.get("id", "?"))
+    pending_runs: list[str] = []
+    for run in latest_runs.values():
+        status = (run.get("status") or "").lower()
+        conclusion = (run.get("conclusion") or "").lower()
+        name = run.get("name") or str(run.get("id", "?"))
+        if status != "completed" or not conclusion:
+            pending_runs.append(name)
+        elif conclusion in FAILURE_CONCLUSIONS:
+            failing_runs.append(name)
     if failing_runs:
         reasons.append(
-            f"CI failing ({len(failing_runs)}/{total_runs}: "
-            + ", ".join(failing_runs[:5])
-            + ")"
+            f"CI failing ({len(failing_runs)}/{len(latest_runs)} current workflows: "
+            + ", ".join(failing_runs[:5]) + ")"
+        )
+    if pending_runs:
+        reasons.append(
+            f"CI pending ({len(pending_runs)}/{len(latest_runs)} current workflows: "
+            + ", ".join(pending_runs[:5]) + ")"
         )
 
-    # --- Review decision ---------------------------------------------------
     reviews = gh_json(f"{_GH_API}/repos/{full_name}/pulls/{number}/reviews", token)
     state = _current_review_state(reviews or [], author)
     if state == "CHANGES_REQUESTED":
         reasons.append("review requested changes (CHANGES_REQUESTED)")
+    elif state != "APPROVED" and requested_reviewers and merge_state == "blocked":
+        names = [reviewer.get("login", "?") for reviewer in requested_reviewers]
+        reasons.append("review still requested from " + ", ".join(names[:5]))
 
-    # --- Unresolved review threads (from allowlisted authors only) ----------
-    unresolved = _unresolved_threads(full_name, number, token)
+    unresolved = _unresolved_threads(full_name, number, author, token)
     if unresolved:
         reasons.append(f"{unresolved} unresolved review thread(s)")
 
     return bool(reasons), reasons
+
+
+def waiting_on_human(full_name: str, number: int, token: str) -> bool:
+    """Return true only while a human-approval marker remains unacknowledged."""
+    owner, _, repo = full_name.partition("/")
+    query = """
+    query($o: String!, $r: String!, $n: Int!) {
+      repository(owner: $o, name: $r) {
+        pullRequest(number: $n) {
+          comments(last: 1) { nodes { body createdAt author { login } } }
+          reviews(last: 25) { nodes { submittedAt author { login } } }
+          commits(last: 1) { nodes { commit { committedDate } } }
+        }
+      }
+    }
+    """
+    data = gh_graphql(query, {"o": owner, "r": repo, "n": number}, token)
+    pr = ((data.get("data") or {}).get("repository") or {}).get("pullRequest") or {}
+    comments = ((pr.get("comments") or {}).get("nodes") or [])
+    if not comments:
+        return False
+    marker = comments[-1] or {}
+    if HUMAN_APPROVAL_MARKER.lower() not in (marker.get("body") or "").lower():
+        return False
+    marker_at = marker.get("createdAt") or ""
+    for review in ((pr.get("reviews") or {}).get("nodes") or []):
+        login = ((review.get("author") or {}).get("login") or "").lower()
+        if login and login not in REVIEWER_BOT_LOGINS and (review.get("submittedAt") or "") > marker_at:
+            return False
+    commits = ((pr.get("commits") or {}).get("nodes") or [])
+    committed_at = (((commits[-1] if commits else {}).get("commit") or {}).get("committedDate") or "")
+    return committed_at <= marker_at
 
 
 # --------------------------------------------------------------------------- #
@@ -398,7 +486,12 @@ def kv_get(key: str):
         with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read())["value"]
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+        if exc.code in (404, 500):
+            # 404 = key doesn't exist yet (normal for first run)
+            # 500 = decrypt failure (stale encrypted state after key rotation);
+            #       treat as missing so the script starts fresh instead of crashing
+            if exc.code == 500:
+                log("kv_get: 500 on %s (likely stale encrypted state); starting fresh" % key)
             return None
         raise
 
@@ -413,8 +506,14 @@ def kv_set(key: str, value) -> None:
         },
         method="PUT",
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 500:
+            log("kv_set: 500 on %s (stale encrypted state); skipping remote save" % key)
+            return
+        raise
 
 
 def _state_file_path() -> Path:
@@ -550,6 +649,77 @@ def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
     return records
 
 
+def all_iterate_conversations() -> list[dict]:
+    """Page the agent server and return every ``iterate``-tagged conversation.
+
+    The identity tag (``iterepo`` = ``iterate:{org}/{repo}#{number}``) is stable for
+    a PR even as its head changes, unlike this automation's durable KV state, whose
+    per-PR ``conv_ids`` are reset on head changes / pod restarts. Scanning the
+    catalog by tag is therefore the authoritative dedup source: it rediscovers an
+    existing conversation for a PR regardless of whether its id is still recorded
+    in state, so the watchdog follows up on it instead of creating a duplicate.
+    """
+    url, key = _agent_server()
+    if not url or not key:
+        raise RuntimeError("AGENT_SERVER_URL / SESSION_API_KEY not available")
+
+    out: list[dict] = []
+    page = None
+    while True:
+        query = "limit=100" + (("&page_id=" + str(page)) if page else "")
+        req = urllib.request.Request(
+            f"{url}/api/conversations/search?{query}",
+            headers={
+                "X-Session-API-Key": key,
+                "ngrok-skip-browser-warning": "1",
+                "Connection": "close",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        for it in data.get("items", []):
+            tags = it.get("tags") or {}
+            if TAG_FLAG not in tags:
+                continue
+            status = it.get("execution_status")
+            if isinstance(status, dict):
+                status = status.get("value") or status.get("name")
+            out.append(
+                {
+                    "id": str(it.get("id")),
+                    "status": str(status).lower() if status else "",
+                    "tags": tags,
+                }
+            )
+        page = data.get("next_page_id")
+        if not page:
+            break
+    return out
+
+
+def _index_iterate_conversations(
+    listing: list[dict],
+) -> tuple[dict, dict[str, list[str]], int]:
+    """Build dedup indexes from a conversation listing.
+
+    Returns ``(conv_index, identity_ids, iterate_open)`` where ``identity_ids`` maps
+    each ``iterate:{org}/{repo}#{number}`` identity to its conversation ids and
+    ``iterate_open`` counts the currently-active ``iterate`` conversations.
+    """
+    conv_index: dict[str, dict] = {}
+    identity_ids: dict[str, list[str]] = {}
+    iterate_open = 0
+    for c in listing:
+        conv_index[c["id"]] = c
+        tagged = TAG_FLAG in (c["tags"] or {})
+        if c["status"] in OPEN_STATUSES and tagged:
+            iterate_open += 1
+        identity = (c["tags"] or {}).get(TAG_TARGET)
+        if identity and tagged:
+            identity_ids.setdefault(identity, []).append(c["id"])
+    return conv_index, identity_ids, iterate_open
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
@@ -557,17 +727,6 @@ def get_known_agent_conversations(conversation_ids: list[str]) -> list[dict]:
 def build_prompt(pr: dict, reasons: list[str]) -> str:
     base = (_SCRIPT_DIR / "prompt.txt").read_text()
     context = "\n".join(f"- {r}" for r in reasons) or "- (fresh check; inspect PR)"
-    draft_note = ""
-    if pr.get("draft"):
-        draft_note = """
-- **This is a DRAFT PR.** Iterate on it the same as a non-draft PR — fix CI,
-  resolve conflicts, address review feedback. When ALL acceptance criteria are
-  met (CI green, no merge conflicts, no unresolved review threads), convert the
-  PR from draft to ready-for-review using:
-  `gh pr ready {pr['number']} --repo {pr['full_name']}`
-  Only do this once every present verification layer is green. If a genuine
-  blocker remains, leave it as draft and report the blocker.
-"""
     return f"""## Target PR
 
 - Repository: {pr['full_name']}
@@ -577,7 +736,7 @@ def build_prompt(pr: dict, reasons: list[str]) -> str:
 - Base branch: {pr['base_ref']}
 - Head SHA: {pr['head_sha']}
 - URL: {pr['url']}
-{draft_note}
+
 ## Current blockers surfaced by the watchdog
 
 {context}
@@ -587,14 +746,29 @@ def build_prompt(pr: dict, reasons: list[str]) -> str:
 {base}"""
 
 
+def ensure_sdk() -> None:
+    """Install the runtime-matched SDK only when a PR needs engagement."""
+    try:
+        sdk_available = importlib.util.find_spec("openhands.sdk") is not None
+    except ModuleNotFoundError:
+        sdk_available = False
+    if sdk_available:
+        return
+    setup = _SCRIPT_DIR / "setup.sh"
+    log("OpenHands SDK unavailable; bootstrapping engagement environment")
+    subprocess.run(["bash", str(setup)], cwd=_SCRIPT_DIR, check=True)
+    python = _SCRIPT_DIR / ".venv" / "bin" / "python"
+    os.execv(str(python), [str(python), str(_SCRIPT_DIR / "main.py")])
+
+
 def _workspace_ctx():
     """Return the SDK workspace context manager for the current runtime.
 
     Local mode (``AGENT_SERVER_URL`` set) uses ``RemoteWorkspace`` talking
     straight to the local agent server (as the ``graham-daily-workflow-prep``
     automation does); otherwise ``OpenHandsCloudWorkspace`` for a cloud sandbox.
-    Exiting this context fires the automation completion callback exactly once,
-    which is why the whole real-run body is wrapped in a single ``with``.
+    Exiting this context fires the automation completion callback for runs that
+    engage one or more conversations.
     """
     from openhands.sdk.workspace.remote.base import RemoteWorkspace  # noqa: PLC0415
     from openhands.workspace import OpenHandsCloudWorkspace  # noqa: PLC0415
@@ -756,56 +930,69 @@ def main() -> None:
         if not full_name or not number:
             continue
 
-        meta = gh_json(f"{_GH_API}/repos/{full_name}/pulls/{number}", token)
-        if not meta or meta.get("state") != "open":
+        try:
+            meta = gh_json(f"{_GH_API}/repos/{full_name}/pulls/{number}", token)
+            if not meta or meta.get("state") != "open":
+                continue
+            head = meta.get("head") or {}
+            head_sha = head.get("sha", "")
+            head_ref = head.get("ref", "")
+            base_ref = (meta.get("base") or {}).get("ref", "")
+            base_repo = ((meta.get("base") or {}).get("repo") or {}).get("full_name")
+            if base_repo:
+                full_name = base_repo
+
+            if waiting_on_human(full_name, number, token):
+                log(
+                    f"skip {full_name}#{number}: waiting on human "
+                    f"(last comment requests approval)"
+                )
+                continue
+
+            needs, reasons = pr_attention_reasons(
+                full_name,
+                number,
+                GITHUB_AUTHOR,
+                head_sha,
+                token,
+                meta.get("mergeable"),
+                meta.get("mergeable_state"),
+                draft=bool(meta.get("draft")),
+                requested_reviewers=meta.get("requested_reviewers") or [],
+            )
+            pr = {
+                "full_name": full_name,
+                "number": number,
+                "title": item.get("title", ""),
+                "head_ref": head_ref,
+                "base_ref": base_ref,
+                "head_sha": head_sha,
+                "url": item.get("html_url", f"{_GH_API}/repos/{full_name}/pulls/{number}"),
+                "updated_at": item.get("updated_at", ""),
+            }
+            key = f"{full_name}#{number}"
+            if not needs:
+                log(f"ok   {key}: all /iterate conditions satisfied")
+                if key in prs:
+                    del prs[key]
+                continue
+            reasons_text = "; ".join(reasons)
+            log(f"WARN {key}: needs attention ({reasons_text})")
+            candidates.append((pr, reasons))
+        except Exception as exc:
+            log(f"skip {full_name}#{number}: error ({exc})")
             continue
 
-        head = meta.get("head") or {}
-        head_sha = head.get("sha", "")
-        head_ref = head.get("ref", "")
-        base_ref = (meta.get("base") or {}).get("ref", "")
-        # The base repo hosts the PR; the head repo may be a fork. All check-run,
-        # review, and GraphQL calls must target the base repo (the one the search
-        # query already resolved via `repository_url`).
-        base_repo = ((meta.get("base") or {}).get("repo") or {}).get("full_name")
-        if base_repo:
-            full_name = base_repo
-
-        mergeable_state = str(meta.get("mergeable_state") or "")
-        needs, reasons = pr_attention_reasons(
-            full_name,
-            number,
-            GITHUB_AUTHOR,
-            head_sha,
-            token,
-            mergeable_state=mergeable_state,
-        )
-        pr = {
-            "full_name": full_name,
-            "number": number,
-            "title": item.get("title", ""),
-            "head_ref": head_ref,
-            "base_ref": base_ref,
-            "head_sha": head_sha,
-            "mergeable_state": mergeable_state,
-            "draft": bool(meta.get("draft")),
-            "url": item.get("html_url", f"{_GH_API}/repos/{full_name}/pulls/{number}"),
-            "updated_at": item.get("updated_at", ""),
-        }
-        key = f"{full_name}#{number}"
-        if not needs:
-            log(f"ok   {key}: all /iterate conditions satisfied")
-            # Clear stale state once a PR is green again.
-            if key in prs:
-                del prs[key]
-            continue
-        reasons_text = "; ".join(reasons)
-        log(f"WARN {key}: needs attention ({reasons_text})")
-        candidates.append((pr, reasons))
+    dry_run = os.environ.get("ITERATE_DRY_RUN", "") == "1"
+    if not candidates and not dry_run:
+        save_state(state)
+        log("no PRs require attention this run")
+        fire_callback()
+        log("run complete")
+        return
 
     # 2. Decide which candidates to engage (start new or send a follow-up),
-    #    honoring the boundary guards (per-head attempt budget, in-flight guard,
-    #    per-run cap) and the global cap on open /iterate conversations.
+    #    honoring the in-flight guard, per-run cap, and global concurrency cap.
 
     # Snapshot the agent server's conversation set once. It's used both to find
     # an already-existing "iterate:{org}/{repo}#{number}" tagged conversation per
@@ -816,60 +1003,52 @@ def main() -> None:
     iterate_open = 0  # number of open (non-terminal) /iterate conversations
     identity_ids: dict[str, list[str]] = {}  # iterate identity tag -> [conv ids]
     try:
-        recorded_ids = known_conversation_ids(prs)
-        conv_listing = get_known_agent_conversations(recorded_ids)
-        for c in conv_listing:
-            conv_index[c["id"]] = c
-            tagged = TAG_FLAG in (c["tags"] or {})
-            if c["status"] in OPEN_STATUSES and tagged:
-                iterate_open += 1
-            identity = (c["tags"] or {}).get(TAG_TARGET)
-            if identity and tagged:
-                identity_ids.setdefault(identity, []).append(c["id"])
-        log(
-            f"agent server: checked {len(recorded_ids)} recorded conversation id(s), "
-            f"found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
+        # Authoritative dedup: scan the catalog for every conversation tagged with
+        # this PR's identity. This finds existing conversations even when their id
+        # is no longer recorded in KV state (which resets on head changes/pods).
+        conv_listing = all_iterate_conversations()
+        conv_index, identity_ids, iterate_open = _index_iterate_conversations(
+            conv_listing
         )
-    except Exception as exc:  # noqa: BLE001 - tag dedup unavailable
-        log(f"could not get recorded agent conversations ({exc}); falling back to state")
+        log(
+            f"agent server: found {len(conv_listing)} iterate conversation(s), "
+            f"{iterate_open} open /iterate conversation(s)"
+        )
+    except Exception as exc:  # noqa: BLE001 - fall back to recorded-ids batch get
+        log(f"could not scan iterate conversations ({exc}); falling back to recorded ids")
+        try:
+            recorded_ids = known_conversation_ids(prs)
+            conv_listing = get_known_agent_conversations(recorded_ids)
+            conv_index, identity_ids, iterate_open = _index_iterate_conversations(
+                conv_listing
+            )
+            log(
+                f"agent server: checked {len(recorded_ids)} recorded conversation "
+                f"id(s), found {len(conv_listing)}, {iterate_open} open /iterate conversation(s)"
+            )
+        except Exception as exc2:  # noqa: BLE001 - tag dedup unavailable
+            log(f"could not get recorded agent conversations ({exc2}); dedup by state only")
 
     candidates.sort(key=lambda c: c[0]["updated_at"], reverse=True)
     plan: list[dict] = []  # {action, pr, reasons, target_id}
     open_used = iterate_open  # running tally; both starts and follow-ups consume a slot
-    new_started = 0  # how many brand-new conversations we've queued this run
+    engagements_planned = 0  # new starts + follow-ups queued this run
 
     for pr, reasons in candidates:
         key = f"{pr['full_name']}#{pr['number']}"
         rec = prs.get(key, {})
         prior_sha = rec.get("head_sha")
         if prior_sha != pr["head_sha"]:
-            # New head: fresh set of attempts, clear the human-escalation marker.
+            # New head: fresh set of attempts and clear the human-escalation marker,
+            # but KEEP the tracked conversation ids so identity-tag dedup still sees
+            # the existing conversation and follows up instead of creating a duplicate.
             prs[key] = {
                 "head_sha": pr["head_sha"],
                 "attempts": 0,
-                "conv_ids": [],
-                "needs_human": None,
+                "conv_ids": [cid for cid in (rec or {}).get("conv_ids", [])] or [],
+                "consecutive_errors": 0,
             }
             rec = prs[key]
-
-        if rec.get("needs_human"):
-            reason = rec["needs_human"].get("reason", "requires human")
-            log(f"skip {key}: flagged needs_human ({reason}); waiting for new push")
-            continue
-
-        if rec.get("attempts", 0) >= MAX_ATTEMPTS_PER_SHA:
-            rec["needs_human"] = {
-                "reason": (
-                    f"not resolved after {rec['attempts']} dispatch attempts on "
-                    f"head {pr['head_sha'][:7]}; likely cannot be auto-fixed"
-                ),
-                "at": now,
-            }
-            log(
-                f"skip {key}: attempt budget exhausted for "
-                f"{pr['head_sha'][:7]}; flagged for human review"
-            )
-            continue
 
         # Collect every conversation we already know of for this PR:
         #  - any conversation tagged with this PR's iterate identity
@@ -900,10 +1079,41 @@ def main() -> None:
             log(f"skip {key}: fix conversation already in flight ({active[0]})")
             continue
 
-        if known_ids:
-            # (2b) A tagged conversation exists but is not running: send it a
-            # follow-up message instead of creating a new conversation.
-            target_id = known_ids[-1]
+        # The user-facing per-run cap applies to all work launched by this
+        # automation. Previously only brand-new conversations incremented it,
+        # so six follow-ups plus two new starts could fan out eight agents even
+        # with MAX_PER_RUN=4.
+        if engagements_planned >= MAX_PER_RUN:
+            log(f"skip {key}: already engaging {MAX_PER_RUN} this run")
+            continue
+
+        # Failed conversations are dead retry targets. Start fresh below rather
+        # than permanently parking the PR after an arbitrary number of failures.
+        failed_ids: list[str] = []
+        if conv_listing is not None:
+            statuses = [
+                conv_index.get(cid, {}).get("status", "") for cid in known_ids
+            ]
+            failed_ids = [
+                cid for cid, status in zip(known_ids, statuses)
+                if status in FAILED_STATUSES
+            ]
+
+        # Workable retry targets are conversations that are alive (idle) or
+        # finished — send them a follow-up. A failed conversation is dead, so it
+        # is deliberately excluded: retrying it means starting fresh, not poking
+        # an errored run that can't make progress.
+        if conv_listing is not None:
+            retry_targets = [
+                cid for cid in known_ids
+                if conv_index.get(cid, {}).get("status") not in FAILED_STATUSES
+            ]
+        else:
+            retry_targets = known_ids
+
+        if retry_targets:
+            # Listings are newest-first; re-engage the most recent viable context.
+            target_id = retry_targets[0]
             plan.append(
                 {
                     "action": "follow_up",
@@ -913,17 +1123,16 @@ def main() -> None:
                 }
             )
             open_used += 1
+            engagements_planned += 1
             log(
                 f"FOLLOW-UP {key}: re-engaging conversation {target_id} "
                 f"({'; '.join(reasons)})"
             )
             continue
 
-        # No existing conversation for this PR: start a new one, subject to the
-        # per-run cap and the global cap on open /iterate conversations.
-        if new_started >= MAX_PER_RUN:
-            log(f"skip {key}: already starting {MAX_PER_RUN} this run")
-            continue
+        # Only failed (or no) conversations remain: start a fresh retry,
+        # subject to the per-run cap and the global cap on open /iterate
+        # conversations.
         if open_used >= MAX_OPEN_CONVERSATIONS:
             log(
                 f"skip {key}: already at {MAX_OPEN_CONVERSATIONS} open /iterate "
@@ -933,12 +1142,17 @@ def main() -> None:
         plan.append(
             {"action": "new", "pr": pr, "reasons": reasons, "target_id": None}
         )
-        new_started += 1
+        engagements_planned += 1
         open_used += 1
-        log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
+        if failed_ids:
+            log(
+                f"RETRY {key}: fresh conversation after errored attempt "
+                f"({'; '.join(reasons)})"
+            )
+        else:
+            log(f"NEW {key}: starting fix conversation ({'; '.join(reasons)})")
 
     # 3. Engage (start / follow up on) fix conversations.
-    dry_run = os.environ.get("ITERATE_DRY_RUN", "") == "1"
     if dry_run:
         log(f"DRY RUN: would engage {len(plan)} conversation(s)")
         for item in plan:
@@ -952,9 +1166,16 @@ def main() -> None:
         log("DRY RUN complete (check-only; no completion callback)")
         return
 
-    # Real run: wrap the whole body in ONE workspace context so the completion
-    # callback fires exactly once on exit — covering both the dispatch path and
-    # the "nothing to do" path (otherwise a no-op run would never fire it).
+    if not plan:
+        save_state(state)
+        log("no PRs require attention this run")
+        fire_callback()
+        log("run complete")
+        return
+
+    # Engagement needs the SDK to construct a fully configured agent. The common
+    # no-op path above deliberately avoids installation and workspace/LLM setup.
+    ensure_sdk()
     with _workspace_ctx() as workspace:
         model_profile = os.environ.get("AUTOMATION_MODEL") or None
         try:
@@ -989,7 +1210,6 @@ def main() -> None:
                         rec["conv_ids"].append(conv_id)
                     rec["attempts"] = rec.get("attempts", 0) + 1
                     rec["last_dispatched_at"] = now
-                    rec["needs_human"] = None
                     engaged += 1
                 except Exception as exc:  # noqa: BLE001
                     log(f"failed to engage {key}: {exc}")

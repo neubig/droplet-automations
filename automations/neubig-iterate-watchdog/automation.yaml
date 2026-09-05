@@ -1,11 +1,11 @@
 enabled: true
-entrypoint: .venv/bin/python main.py
+entrypoint: python3 main.py
 keep_alive: null
 model: null
 name: Neubig Iterate Watchdog
 preset_metadata: null
 prompt: null
-setup_script_path: setup.sh
+setup_script_path: null
 tarball_source:
   type: internal
   url: null

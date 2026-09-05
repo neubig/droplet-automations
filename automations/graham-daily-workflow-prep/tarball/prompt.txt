@@ -52,18 +52,10 @@ For every issue associated with Graham's open PRs:
 
 ## Step 4: Ensure Linear Tracking
 
-For every associated GitHub issue, perform a deterministic ingestion check. Do not infer that tracking is missing from a single empty search result, from Graham's assigned-issues list, or from a truncated/paginated response.
-
-1. Build the canonical GitHub issue URL (`https://github.com/{owner}/{repo}/issues/{number}`), the issue title, and repository-qualified title.
-2. Search Linear first by the exact GitHub issue URL, including URLs embedded in descriptions, attachments, relations, and pull-request linkbacks. Use Linear MCP search/list tools or the GraphQL API as available.
-3. Search again by the exact issue title and then a distinctive repository-qualified title fragment. Search across all issue states and assignees; an ingested issue may be unassigned, assigned to somebody else, completed, canceled, duplicate, archived, or in triage.
-4. Paginate every Linear result set until `hasNextPage` is false. If a tool returns a cursor, continue with that cursor. Do not treat a first-page result as exhaustive.
-5. Match only when the GitHub URL, GitHub issue identifier/title, or a clearly equivalent repository-qualified title confirms the association. Record the Linear identifier and URL, state, archived status, and assignee.
-6. If the issue is found but not assigned to Graham, report the assignment gap and propose assignment; do not mutate Linear.
-7. If no match is found after all URL/title searches and pagination, report `No Linear match found after exhaustive URL/title search` and propose tracking. Include the exact searches performed so a false negative can be diagnosed.
-8. If Linear search cannot inspect descriptions, links, archived issues, or pagination, report that limitation instead of claiming missing tracking.
-
-The Linear tracking table must distinguish these outcomes: `Matched`, `Matched but not assigned to Graham`, `No match after exhaustive search`, and `Unable to verify`. Never use Graham's assigned-issues query as the sole ingestion check.
+For every associated GitHub issue:
+1. Check whether it has been ingested into Linear (search Linear for matching titles or GitHub links).
+2. If a matching Linear ticket exists, verify it is assigned to Graham.
+3. Note any missing Linear tracking as a proposed action.
 
 If Linear tools are unavailable, continue the rest of the workflow and list the exact Linear checks that could not be completed.
 
@@ -91,7 +83,18 @@ Do not create any Slack-derived tickets — only propose them.
 
 ## Step 6: Prioritize Unprioritized Linear Tickets
 
-Use the pre-fetched Linear snapshot supplied by the automation for the initial assigned-ticket inventory. It excludes completed, canceled, and duplicate tickets; filter blocked issues locally before reporting. Use targeted Linear reads only when the snapshot lacks required details.
+Fetch Graham's incomplete, unblocked assigned Linear tickets with priority `0 No priority`. Use the Linear GraphQL API to exclude completed, canceled, and duplicate tickets:
+
+```bash
+curl -s -X POST https://api.linear.app/graphql \
+  -H "Content-Type: application/json" \
+  -H "Authorization: $LINEAR_API_KEY" \
+  -d '{
+    "query": "query { viewer { assignedIssues(first: 250, filter: { state: { type: { nin: [\"completed\", \"canceled\", \"duplicate\"] } } }) { nodes { id identifier title priority priorityLabel state { name type } labels { nodes { name } } url createdAt updatedAt dueDate } } } }"
+  }' | jq '.data.viewer.assignedIssues.nodes'
+```
+
+Alternatively, use Linear MCP `list_issues` with `assignee=me` and filter locally.
 
 When active unprioritized tickets exist:
 1. Exclude completed, canceled, duplicate, archived, and blocked tickets.

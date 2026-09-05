@@ -24,8 +24,14 @@ if ! command -v python3 >/dev/null 2>&1; then
     fi
 fi
 set +e
-SDK_VERSION=$(curl -sf "${AUTOMATION_API_URL}/sdk-version" \
-  | ${PYTHON_JSON} -c "import sys, json; print(json.load(sys.stdin)['version'])" 2>/dev/null)
+SDK_VERSION=""
+for attempt in 1 2 3 4 5; do
+    SDK_VERSION=$(curl --retry 2 --retry-delay 2 -sf "${AUTOMATION_API_URL}/sdk-version" \
+      | ${PYTHON_JSON} -c 'import sys, json; print(json.load(sys.stdin)["version"])' 2>/dev/null)
+    if [ -n "$SDK_VERSION" ]; then break; fi
+    echo "[setup] SDK version lookup failed (attempt $attempt/5); retrying" >&2
+    sleep $((attempt * 2))
+done
 set -e
 if [ -z "$SDK_VERSION" ]; then
     echo "[setup] ERROR: Failed to fetch SDK version from ${AUTOMATION_API_URL}/sdk-version" >&2
